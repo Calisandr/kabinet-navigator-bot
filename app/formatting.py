@@ -78,9 +78,7 @@ def format_teacher_schedule(
     for entry in entries:
         by_day[entry.day].append(entry)
 
-    upcoming_days = [day for day in sorted(by_day) if day >= today]
-    past_days = [day for day in sorted(by_day) if day < today]
-    ordered_days = (upcoming_days + past_days)[:limit]
+    ordered_days = sorted(by_day)[:limit]
 
     teacher_names = sorted({entry.teacher for entry in entries}, key=sort_key_ru)
     heading = ", ".join(teacher_names[:3])
