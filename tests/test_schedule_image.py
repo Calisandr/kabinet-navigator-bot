@@ -5,7 +5,11 @@ from datetime import date
 from PIL import Image
 
 from app.schedule import ScheduleEntry
-from app.schedule_image import render_day_schedule_image
+from app.schedule_image import format_compact_date, render_day_schedule_image
+
+
+def test_compact_date_is_single_line_day_month() -> None:
+    assert format_compact_date(date(2026, 4, 29)) == "29.04"
 
 
 def test_render_day_schedule_image_returns_png() -> None:
