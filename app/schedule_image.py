@@ -140,7 +140,7 @@ def build_lesson_room_groups(entries: Iterable[ScheduleEntry]) -> list[tuple[str
 
 
 def pill_width_for(text: str, font: ImageFont.FreeTypeFont) -> int:
-    return text_width(text, font) + 52
+    return text_width(text, font) + 40
 
 
 def layout_lesson_room_groups(
@@ -223,8 +223,8 @@ def draw_card(image: Image.Image, height: int) -> None:
         (CARD_X, CARD_X, CARD_X + CARD_W, height - CARD_X),
         radius=34,
         fill=CARD,
-        outline=(217, 225, 238),
-        width=2,
+        outline=(228, 234, 244),
+        width=1,
     )
 
 
@@ -242,11 +242,10 @@ def draw_header(
     rounded_gradient(image, (x, y, x + w, y + h), 34, NAVY, NAVY_2)
     draw = ImageDraw.Draw(image)
 
-    draw.rounded_rectangle((x + w - 338, y + 34, x + w - 34, y + 84), radius=25, fill=(255, 255, 255, 232), outline=(255, 255, 255), width=1)
+    draw.rounded_rectangle((x + w - 338, y + 34, x + w - 34, y + 84), radius=25, fill=(255, 255, 255, 232))
     source = "Google Таблица"
     source_w = text_width(source, fonts.semibold(21))
     draw.text((x + w - 186 - source_w / 2, y + 46), source, font=fonts.semibold(21), fill=MUTED)
-    draw.line((x + 36, y + h - 30, x + w - 36, y + h - 30), fill=(255, 255, 255, 34), width=1)
 
     date_box = (x + 34, y + 36, x + 230, y + 116)
     draw.rounded_rectangle(date_box, radius=26, fill=(255, 255, 255, 242))
@@ -256,9 +255,9 @@ def draw_header(
 
     weekday = WEEKDAYS[target.weekday()]
     weekday_box = (x + 34, y + 132, x + 230, y + 178)
-    draw.rounded_rectangle(weekday_box, radius=23, fill=(255, 247, 230, 238), outline=(255, 255, 255, 70), width=1)
+    draw.rounded_rectangle(weekday_box, radius=23, fill=(255, 255, 255, 232))
     weekday_w = text_width(weekday, fonts.semibold(22))
-    draw.text((weekday_box[0] + (196 - weekday_w) / 2, y + 140), weekday, font=fonts.semibold(22), fill=(151, 97, 18))
+    draw.text((weekday_box[0] + (196 - weekday_w) / 2, y + 140), weekday, font=fonts.semibold(22), fill=NAVY_2)
 
     text_x = x + 266
     metrics_left = x + w - 304
@@ -297,10 +296,14 @@ def draw_metric(
 def draw_section_title(draw: ImageDraw.ImageDraw, y: int, fonts: "FontSet") -> None:
     draw.text((CONTENT_X, y), "Кабинеты по парам", font=fonts.bold(38), fill=INK)
     subtitle = "преподаватель, пара и аудитория"
-    subtitle_w = text_width(subtitle, fonts.semibold(22))
-    chip_x = CONTENT_X + CONTENT_W - subtitle_w - 36
-    draw.rounded_rectangle((chip_x, y + 4, CONTENT_X + CONTENT_W, y + 44), radius=20, fill=CHIP_MINT)
-    draw.text((chip_x + 18, y + 10), subtitle, font=fonts.semibold(22), fill=(13, 116, 103))
+    subtitle_font = fonts.semibold(20)
+    subtitle_w = text_width(subtitle, subtitle_font)
+    draw.text(
+        (CONTENT_X + CONTENT_W - subtitle_w, y + 16),
+        subtitle,
+        font=subtitle_font,
+        fill=MUTED,
+    )
 
 
 def draw_row(
@@ -312,13 +315,25 @@ def draw_row(
 ) -> int:
     height = int(row["height"])
     row_box = (CONTENT_X, y, CONTENT_X + CONTENT_W, y + height)
-    draw.rounded_rectangle(row_box, radius=24, fill=SOFT, outline=LINE, width=1)
-    draw.rounded_rectangle((CONTENT_X + 18, y + 18, CONTENT_X + 82, y + height - 18), radius=22, fill=(235, 242, 255))
-    draw.rounded_rectangle((CONTENT_X + 18, y + 18, CONTENT_X + 28, y + height - 18), radius=5, fill=GOLD)
-    draw.rounded_rectangle((CONTENT_X + 36, y + 28, CONTENT_X + 72, y + 64), radius=14, fill=(255, 255, 255, 218))
+    draw.rounded_rectangle(row_box, radius=24, fill=SOFT, outline=(232, 238, 248), width=1)
+
+    badge_size = 56
+    badge_left = CONTENT_X + 26
+    badge_top = y + (height - badge_size) // 2
+    draw.rounded_rectangle(
+        (badge_left, badge_top, badge_left + badge_size, badge_top + badge_size),
+        radius=18,
+        fill=CHIP_BLUE,
+    )
     number = f"{index:02d}"
-    number_w = text_width(number, fonts.bold(20))
-    draw.text((CONTENT_X + 54 - number_w / 2, y + 35), number, font=fonts.bold(20), fill=BLUE)
+    number_font = fonts.bold(22)
+    number_w = text_width(number, number_font)
+    draw.text(
+        (badge_left + (badge_size - number_w) / 2, badge_top + 13),
+        number,
+        font=number_font,
+        fill=BLUE,
+    )
 
     text_x = CONTENT_X + 110
     line_y = y + 24
@@ -356,13 +371,10 @@ def draw_lesson_pill(
 ) -> None:
     draw.rounded_rectangle(
         (x, y, x + width, y + PILL_H),
-        radius=19,
+        radius=PILL_H // 2,
         fill=CHIP_BLUE,
-        outline=(213, 224, 248),
-        width=1,
     )
-    draw.ellipse((x + 15, y + 14, x + 25, y + 24), fill=BLUE)
-    draw.text((x + 36, y + 7), text, font=fonts.semibold(22), fill=(28, 64, 158))
+    draw.text((x + 20, y + 7), text, font=fonts.semibold(22), fill=(28, 64, 158))
 
 
 def draw_room_pill(
@@ -375,13 +387,12 @@ def draw_room_pill(
 ) -> None:
     draw.rounded_rectangle(
         (x, y, x + width, y + PILL_H),
-        radius=19,
+        radius=PILL_H // 2,
         fill=(255, 255, 255),
-        outline=(219, 228, 242),
+        outline=(220, 226, 238),
         width=1,
     )
-    draw.ellipse((x + 15, y + 14, x + 25, y + 24), fill=GOLD)
-    draw.text((x + 36, y + 7), text, font=fonts.bold(22), fill=INK)
+    draw.text((x + 20, y + 7), text, font=fonts.bold(22), fill=NAVY)
 
 
 def draw_empty_state(draw: ImageDraw.ImageDraw, fonts: "FontSet", y: int) -> int:
