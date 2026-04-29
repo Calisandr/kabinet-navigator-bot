@@ -57,7 +57,7 @@ def format_day_schedule(target: date, entries: Iterable[ScheduleEntry]) -> str:
         lines.append(f"• <b>{escape(teacher)}</b> - {escape(lesson_text)}")
 
     lines.append("")
-    lines.append("Предметы в таблице не указаны, поэтому показываю уроки и кабинеты.")
+    lines.append("Предметы в таблице не указаны, поэтому показываю пары и кабинеты.")
     return "\n".join(lines)
 
 
@@ -142,9 +142,13 @@ def format_lesson_rooms(entries: Iterable[ScheduleEntry]) -> str:
 
 
 def compress_lessons(lessons: list[str]) -> str:
+    if not lessons:
+        return "пары не указаны"
+
     numeric = [int(item) for item in lessons if item.isdigit()]
     if len(numeric) != len(lessons):
-        return ", ".join(lessons) + " уроки"
+        word = "пара" if len(lessons) == 1 else "пары"
+        return f"{', '.join(lessons)} {word}"
 
     ranges: list[str] = []
     start = prev = numeric[0]
@@ -156,13 +160,13 @@ def compress_lessons(lessons: list[str]) -> str:
         start = prev = item
     ranges.append(format_range(start, prev))
     label = ", ".join(ranges)
-    word = "урок" if len(numeric) == 1 else "уроки"
+    word = "пара" if len(numeric) == 1 else "пары"
     return f"{label} {word}"
 
 
 def format_range(start: int, end: int) -> str:
     if start == end:
-        return str(start)
+        return f"{start}-я"
     return f"{start}-{end}"
 
 
