@@ -1,0 +1,1 @@
+"""Kabinet Navigator bot package."""

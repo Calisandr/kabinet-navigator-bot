@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from .config import Settings, load_settings
+from .formatting import (
+    format_day_schedule,
+    format_next_dates,
+    format_short_date,
+    format_teacher_schedule,
+    format_teachers_list,
+    split_long_message,
+)
+from .schedule import GoogleSheetScheduleRepository, Schedule
+
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+LOGGER = logging.getLogger(__name__)
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Сегодня", "Завтра"],
+        ["Ближайшие даты", "Найти учителя"],
+        ["Все учителя", "Обновить"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Введите фамилию или дату",
+)
+
+
+class ScheduleCache:
+    def __init__(self, repository: GoogleSheetScheduleRepository, ttl_seconds: int) -> None:
+        self.repository = repository
+        self.ttl_seconds = ttl_seconds
+        self._schedule: Schedule | None = None
+        self._loaded_monotonic = 0.0
+        self._lock = asyncio.Lock()
+
+    async def get(self, force: bool = False) -> Schedule:
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            is_fresh = self._schedule is not None and now - self._loaded_monotonic < self.ttl_seconds
+            if is_fresh and not force:
+                return self._schedule
+
+            schedule = await asyncio.to_thread(self.repository.load)
+            self._schedule = schedule
+            self._loaded_monotonic = now
+            LOGGER.info("Loaded %s schedule entries", len(schedule.entries))
+            return schedule
+
+
+def get_cache(context: ContextTypes.DEFAULT_TYPE) -> ScheduleCache:
+    return context.application.bot_data["schedule_cache"]
+
+
+def get_settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
+    return context.application.bot_data["settings"]
+
+
+def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
+    timezone_name = get_settings(context).timezone
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("UTC")
+    return datetime.now(timezone).date()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Кабинетный Навигатор</b>\n\n"
+        "Я показываю, кто из учителей в каком компьютерном кабинете находится "
+        "по данным Google Таблицы.\n\n"
+        "Можно нажать кнопку или просто отправить фамилию: <code>Григорьев</code>.\n"
+        "Для даты подходит формат: <code>02.05.2026</code>."
+    )
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Команды</b>\n\n"
+        "/today - расписание на сегодня\n"
+        "/tomorrow - расписание на завтра\n"
+        "/next - ближайшие даты из таблицы\n"
+        "/date 02.05.2026 - расписание на дату\n"
+        "/teacher Короткова - поиск учителя\n"
+        "/teachers - список учителей и событий\n"
+        "/refresh - обновить данные из таблицы"
+    )
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_date_schedule(update, context, today_for(context))
+
+
+async def tomorrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_date_schedule(update, context, today_for(context) + timedelta(days=1))
+
+
+async def date_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = " ".join(context.args).strip()
+    target = parse_user_date(raw, today_for(context))
+    if target is None:
+        await update.effective_message.reply_text(
+            "Напиши дату после команды, например: <code>/date 02.05.2026</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    await send_date_schedule(update, context, target)
+
+
+async def teacher_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip()
+    if not query:
+        context.user_data["awaiting_teacher"] = True
+        await update.effective_message.reply_text(
+            "Введите фамилию или часть ФИО учителя.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    await send_teacher_schedule(update, context, query)
+
+
+async def teachers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    schedule = await get_cache(context).get()
+    await reply_split(update, format_teachers_list(schedule.teachers))
+
+
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_next_dates(update, context)
+
+
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    await message.reply_text("Обновляю расписание из Google Таблицы...")
+    schedule = await get_cache(context).get(force=True)
+    text = (
+        "Готово. "
+        f"Загружено записей: <b>{len(schedule.entries)}</b>, "
+        f"дат: <b>{len(schedule.dates)}</b>."
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").strip()
+    lowered = text.casefold()
+
+    if lowered == "сегодня":
+        await send_date_schedule(update, context, today_for(context))
+        return
+    if lowered == "завтра":
+        await send_date_schedule(update, context, today_for(context) + timedelta(days=1))
+        return
+    if lowered == "ближайшие даты":
+        await send_next_dates(update, context)
+        return
+    if lowered == "найти учителя":
+        context.user_data["awaiting_teacher"] = True
+        await update.effective_message.reply_text(
+            "Введите фамилию или часть ФИО учителя.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if lowered == "все учителя":
+        await teachers_command(update, context)
+        return
+    if lowered == "обновить":
+        await refresh_command(update, context)
+        return
+
+    parsed_date = parse_user_date(text, today_for(context))
+    if parsed_date:
+        context.user_data.pop("awaiting_teacher", None)
+        await send_date_schedule(update, context, parsed_date)
+        return
+
+    context.user_data.pop("awaiting_teacher", None)
+    await send_teacher_schedule(update, context, text)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    if data.startswith("date:"):
+        try:
+            target = date.fromisoformat(data.removeprefix("date:"))
+        except ValueError:
+            await query.edit_message_text("Не смог разобрать дату.")
+            return
+        await send_date_schedule(update, context, target, from_callback=True)
+        return
+
+
+async def send_date_schedule(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: date,
+    from_callback: bool = False,
+) -> None:
+    schedule = await get_cache(context).get()
+    text = format_day_schedule(target, schedule.entries_for_date(target))
+    if from_callback and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        return
+    await reply_split(update, text)
+
+
+async def send_teacher_schedule(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+) -> None:
+    schedule = await get_cache(context).get()
+    text = format_teacher_schedule(query, schedule.search_teacher(query), today_for(context))
+    await reply_split(update, text)
+
+
+async def send_next_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    schedule = await get_cache(context).get()
+    dates = schedule.next_dates(today_for(context))
+    buttons = [
+        [InlineKeyboardButton(format_short_date(item), callback_data=f"date:{item.isoformat()}")]
+        for item in dates[:10]
+    ]
+    await update.effective_message.reply_text(
+        format_next_dates(dates),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else MAIN_KEYBOARD,
+    )
+
+
+async def reply_split(update: Update, text: str) -> None:
+    for index, part in enumerate(split_long_message(text)):
+        await update.effective_message.reply_text(
+            part,
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KEYBOARD if index == 0 else None,
+        )
+
+
+def parse_user_date(raw: str, today: date) -> date | None:
+    text = raw.strip()
+    match = re.fullmatch(r"([0-3]?\d)[./-]([01]?\d)(?:[./-](\d{2,4}))?", text)
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year_raw = match.group(3)
+    if year_raw is None:
+        year = today.year
+    elif len(year_raw) == 2:
+        year = 2000 + int(year_raw)
+    else:
+        year = int(year_raw)
+
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "открыть меню"),
+            BotCommand("today", "расписание на сегодня"),
+            BotCommand("tomorrow", "расписание на завтра"),
+            BotCommand("next", "ближайшие даты"),
+            BotCommand("date", "расписание на дату"),
+            BotCommand("teacher", "поиск учителя"),
+            BotCommand("teachers", "список учителей"),
+            BotCommand("refresh", "обновить таблицу"),
+            BotCommand("help", "помощь"),
+        ]
+    )
+
+
+def build_application(settings: Settings) -> Application:
+    repository = GoogleSheetScheduleRepository(settings.google_sheet_id)
+    cache = ScheduleCache(repository, ttl_seconds=settings.cache_minutes * 60)
+
+    application = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
+    application.bot_data["settings"] = settings
+    application.bot_data["schedule_cache"] = cache
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("today", today_command))
+    application.add_handler(CommandHandler("tomorrow", tomorrow_command))
+    application.add_handler(CommandHandler("date", date_command))
+    application.add_handler(CommandHandler("teacher", teacher_command))
+    application.add_handler(CommandHandler("teachers", teachers_command))
+    application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("refresh", refresh_command))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return application
+
+
+def main() -> None:
+    settings = load_settings()
+    application = build_application(settings)
+    LOGGER.info("Kabinet Navigator bot is starting")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
