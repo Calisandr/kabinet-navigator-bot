@@ -15,6 +15,8 @@ class Settings:
     google_sheet_id: str
     timezone: str
     cache_minutes: int
+    webhook_secret: str
+    webhook_url: str
 
 
 def load_settings() -> Settings:
@@ -39,4 +41,6 @@ def load_settings() -> Settings:
         timezone=os.getenv("BOT_TIMEZONE", "Asia/Krasnoyarsk").strip()
         or "Asia/Krasnoyarsk",
         cache_minutes=cache_minutes,
+        webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip(),
+        webhook_url=os.getenv("WEBHOOK_URL", "").strip(),
     )

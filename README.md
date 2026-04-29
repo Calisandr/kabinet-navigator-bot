@@ -31,6 +31,8 @@ TELEGRAM_BOT_TOKEN=123456789:your_token_here
 GOOGLE_SHEET_ID=14inaoG-X5D6U3pLb1o0n3PwpZkSSlxGwoNlb6wVsU0Q
 BOT_TIMEZONE=Asia/Krasnoyarsk
 CACHE_MINUTES=15
+WEBHOOK_SECRET=change_me_to_a_random_secret
+WEBHOOK_URL=https://your-vercel-domain.vercel.app
 ```
 
 Запуск:
@@ -55,6 +57,41 @@ GitHub нужен как репозиторий для кода. Для круг
 
 ```text
 worker: python -m app.bot
+```
+
+## Запуск на Vercel
+
+Vercel запускает не постоянный worker, а HTTP-функции. Поэтому для Vercel используется webhook:
+
+```text
+https://your-vercel-domain.vercel.app/api/webhook
+```
+
+Шаги:
+
+1. Импортируй GitHub-репозиторий в Vercel как новый проект.
+2. В Vercel добавь Environment Variables:
+
+```env
+TELEGRAM_BOT_TOKEN=123456789:your_token_here
+GOOGLE_SHEET_ID=14inaoG-X5D6U3pLb1o0n3PwpZkSSlxGwoNlb6wVsU0Q
+BOT_TIMEZONE=Asia/Krasnoyarsk
+CACHE_MINUTES=15
+WEBHOOK_SECRET=любая_случайная_строка
+```
+
+3. Сделай Deploy.
+4. После деплоя установи webhook из локальной папки проекта:
+
+```bash
+python -m scripts.set_webhook https://your-vercel-domain.vercel.app
+```
+
+Если потом захочешь снова запускать бота локально через polling, сначала удали webhook:
+
+```bash
+python -m scripts.delete_webhook
+python -m app.bot
 ```
 
 ## Команды бота
