@@ -99,10 +99,10 @@ def format_teacher_schedule(
 
 def format_teachers_list(teachers: list[str], limit: int = 120) -> str:
     if not teachers:
-        return "Список учителей пока пуст: таблица не загрузилась или не заполнена."
+        return "Список преподавателей пока пуст: таблица не загрузилась или не заполнена."
 
     shown = teachers[:limit]
-    lines = ["<b>Учителя и события в таблице</b>", ""]
+    lines = ["<b>Преподаватели и события в таблице</b>", ""]
     lines.extend(f"• {escape(item)}" for item in shown)
     if len(teachers) > limit:
         lines.append("")

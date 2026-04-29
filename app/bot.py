@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+from .commands import COMMANDS
 from .config import Settings, load_settings
 from .formatting import (
     format_day_schedule,
@@ -44,8 +45,8 @@ LOGGER = logging.getLogger(__name__)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["Сегодня", "Завтра"],
-        ["Ближайшие даты", "Найти учителя"],
-        ["Все учителя", "Обновить"],
+        ["Ближайшие даты", "Найти преподавателя"],
+        ["Все преподаватели", "Обновить"],
     ],
     resize_keyboard=True,
     input_field_placeholder="Введите фамилию или дату",
@@ -94,7 +95,7 @@ def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>Кабинетный Навигатор</b>\n\n"
-        "Я показываю, кто из учителей в каком компьютерном кабинете находится "
+        "Я показываю, кто из преподавателей в каком компьютерном кабинете находится "
         "по данным Google Таблицы.\n\n"
         "Можно нажать кнопку или просто отправить фамилию: <code>Григорьев</code>.\n"
         "Для даты подходит формат: <code>02.05.2026</code>."
@@ -113,8 +114,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/tomorrow - расписание на завтра\n"
         "/next - ближайшие даты из таблицы\n"
         "/date 02.05.2026 - расписание на дату\n"
-        "/teacher Короткова - поиск учителя\n"
-        "/teachers - список учителей и событий\n"
+        "/teacher Короткова - поиск преподавателя\n"
+        "/teachers - список преподавателей и событий\n"
         "/refresh - обновить данные из таблицы"
     )
     await update.effective_message.reply_text(
@@ -150,7 +151,7 @@ async def teacher_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query:
         context.user_data["awaiting_teacher"] = True
         await update.effective_message.reply_text(
-            "Введите фамилию или часть ФИО учителя.",
+            "Введите фамилию или часть ФИО преподавателя.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -191,14 +192,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if lowered == "ближайшие даты":
         await send_next_dates(update, context)
         return
-    if lowered == "найти учителя":
+    if lowered in {"найти учителя", "найти преподавателя"}:
         context.user_data["awaiting_teacher"] = True
         await update.effective_message.reply_text(
-            "Введите фамилию или часть ФИО учителя.",
+            "Введите фамилию или часть ФИО преподавателя.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
-    if lowered == "все учителя":
+    if lowered in {"все учителя", "все преподаватели"}:
         await teachers_command(update, context)
         return
     if lowered == "обновить":
@@ -303,17 +304,7 @@ def parse_user_date(raw: str, today: date) -> date | None:
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
-        [
-            BotCommand("start", "открыть меню"),
-            BotCommand("today", "расписание на сегодня"),
-            BotCommand("tomorrow", "расписание на завтра"),
-            BotCommand("next", "ближайшие даты"),
-            BotCommand("date", "расписание на дату"),
-            BotCommand("teacher", "поиск учителя"),
-            BotCommand("teachers", "список учителей"),
-            BotCommand("refresh", "обновить таблицу"),
-            BotCommand("help", "помощь"),
-        ]
+        [BotCommand(item["command"], item["description"]) for item in COMMANDS]
     )
 
 
