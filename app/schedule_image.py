@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable
 from datetime import date
 from io import BytesIO
@@ -7,8 +8,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from .formatting import WEEKDAYS, format_lesson_rooms
-from .schedule import ScheduleEntry, group_entries_by_teacher, sort_key_ru
+from .formatting import WEEKDAYS, compress_lessons, room_sort_key
+from .schedule import ScheduleEntry, group_entries_by_teacher, lesson_sort_key, sort_key_ru
 
 
 WIDTH = 1200
@@ -18,6 +19,10 @@ CONTENT_X = CARD_X + 48
 CONTENT_W = CARD_W - 96
 HERO_H = 236
 ROW_GAP = 16
+PILL_H = 38
+PILL_LINE_H = 50
+PAIR_GAP = 8
+GROUP_GAP = 16
 
 BG_TOP = (228, 235, 246)
 BG_BOTTOM = (247, 249, 253)
@@ -74,15 +79,24 @@ def build_rows(entries: list[ScheduleEntry], fonts: "FontSet") -> list[dict[str,
     pill_width = CONTENT_W - 154
 
     for teacher in sorted(grouped, key=sort_key_ru):
-        details = split_details(format_lesson_rooms(grouped[teacher]))
+        lesson_room_groups = build_lesson_room_groups(grouped[teacher])
         teacher_lines = wrap_text(teacher, fonts.bold(31), teacher_width)
-        pill_lines = layout_pills(details, fonts.semibold(23), pill_width)
-        row_height = 88 + len(teacher_lines) * 38 + max(0, len(pill_lines) - 1) * 50
+        pill_lines = layout_lesson_room_groups(
+            lesson_room_groups,
+            fonts.semibold(22),
+            fonts.bold(22),
+            pill_width,
+        )
+        row_height = (
+            92
+            + len(teacher_lines) * 38
+            + max(0, len(pill_lines) - 1) * PILL_LINE_H
+        )
         rows.append(
             {
                 "teacher": teacher_lines,
                 "pill_lines": pill_lines,
-                "height": max(126, row_height),
+                "height": max(132, row_height),
             }
         )
     return rows
@@ -103,8 +117,82 @@ def format_compact_date(target: date) -> str:
     return target.strftime("%d.%m")
 
 
-def split_details(details: str) -> list[str]:
-    return [part.strip() for part in details.split(";") if part.strip()]
+def build_lesson_room_groups(entries: Iterable[ScheduleEntry]) -> list[tuple[str, str]]:
+    by_room: dict[str, list[str]] = defaultdict(list)
+    for entry in entries:
+        if entry.room:
+            by_room[entry.room].append(entry.lesson)
+
+    if not by_room:
+        return [("пары не указаны", "")]
+
+    def group_key(item: tuple[str, list[str]]) -> tuple[tuple[int, str], tuple[int, str]]:
+        room, lessons = item
+        ordered_lessons = sorted(set(lessons), key=lesson_sort_key)
+        first_lesson = lesson_sort_key(ordered_lessons[0]) if ordered_lessons else (999, "")
+        return first_lesson, room_sort_key(room)
+
+    groups: list[tuple[str, str]] = []
+    for room, lessons in sorted(by_room.items(), key=group_key):
+        ordered_lessons = sorted(set(lessons), key=lesson_sort_key)
+        groups.append((compress_lessons(ordered_lessons), f"каб. {room}"))
+    return groups
+
+
+def pill_width_for(text: str, font: ImageFont.FreeTypeFont) -> int:
+    return text_width(text, font) + 52
+
+
+def layout_lesson_room_groups(
+    groups: list[tuple[str, str]],
+    lesson_font: ImageFont.FreeTypeFont,
+    room_font: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[list[dict[str, object]]]:
+    """Lay (lesson, room) pairs into rows of paired pills.
+
+    Each pair is kept on the same line when possible so a single oval never
+    glues different rooms together.
+    """
+
+    bundles: list[dict[str, object]] = []
+    for lesson_text, room_text in groups:
+        lesson_w = pill_width_for(lesson_text, lesson_font)
+        if room_text:
+            room_w = pill_width_for(room_text, room_font)
+            bundle_width = lesson_w + PAIR_GAP + room_w
+        else:
+            room_w = 0
+            bundle_width = lesson_w
+        bundles.append(
+            {
+                "lesson_text": lesson_text,
+                "lesson_width": lesson_w,
+                "room_text": room_text,
+                "room_width": room_w,
+                "bundle_width": bundle_width,
+            }
+        )
+
+    if not bundles:
+        return []
+
+    lines: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    current_width = 0
+    for bundle in bundles:
+        bw = int(bundle["bundle_width"])
+        next_width = bw if not current else current_width + GROUP_GAP + bw
+        if current and next_width > max_width:
+            lines.append(current)
+            current = [bundle]
+            current_width = bw
+            continue
+        current.append(bundle)
+        current_width = next_width
+    if current:
+        lines.append(current)
+    return lines
 
 
 def draw_background(image: Image.Image, height: int) -> None:
@@ -173,11 +261,20 @@ def draw_header(
     draw.text((weekday_box[0] + (196 - weekday_w) / 2, y + 140), weekday, font=fonts.semibold(22), fill=(151, 97, 18))
 
     text_x = x + 266
-    draw.text((text_x, y + 36), "Кабинетный Навигатор", font=fonts.semibold(30), fill=(203, 213, 225))
-    draw.text((text_x, y + 76), "Расписание дня", font=fonts.bold(54), fill=(255, 255, 255))
-    draw.text((text_x, y + 146), f"{target.strftime('%d.%m.%Y')} · пары и кабинеты", font=fonts.semibold(24), fill=(164, 178, 202))
+    metrics_left = x + w - 304
+    text_max = metrics_left - text_x - 24
 
-    draw_metric(draw, x + w - 304, y + 122, f"{entry_count}", "записей", fonts, BLUE)
+    eyebrow_font = fit_font(fonts.semibold, "Кабинетный Навигатор", 30, 22, text_max)
+    draw.text((text_x, y + 36), "Кабинетный Навигатор", font=eyebrow_font, fill=(203, 213, 225))
+
+    title_font = fit_font(fonts.bold, "Расписание дня", 54, 36, text_max)
+    draw.text((text_x, y + 76), "Расписание дня", font=title_font, fill=(255, 255, 255))
+
+    subtitle = f"{target.strftime('%d.%m.%Y')} · пары и кабинеты"
+    subtitle_font = fit_font(fonts.semibold, subtitle, 24, 18, text_max)
+    draw.text((text_x, y + 146), subtitle, font=subtitle_font, fill=(164, 178, 202))
+
+    draw_metric(draw, metrics_left, y + 122, f"{entry_count}", "записей", fonts, BLUE)
     draw_metric(draw, x + w - 158, y + 122, f"{room_count}", "кабинетов", fonts, MINT)
 
 
@@ -232,15 +329,24 @@ def draw_row(
     line_y += 8
     for pill_line in row["pill_lines"]:
         x = text_x
-        for text, width in pill_line:
-            draw_pill(draw, x, line_y, text, width, fonts)
-            x += width + 10
-        line_y += 50
+        for bundle_index, bundle in enumerate(pill_line):
+            if bundle_index > 0:
+                x += GROUP_GAP
+            lesson_w = int(bundle["lesson_width"])
+            draw_lesson_pill(draw, x, line_y, str(bundle["lesson_text"]), lesson_w, fonts)
+            x += lesson_w
+            room_text = str(bundle["room_text"])
+            if room_text:
+                x += PAIR_GAP
+                room_w = int(bundle["room_width"])
+                draw_room_pill(draw, x, line_y, room_text, room_w, fonts)
+                x += room_w
+        line_y += PILL_LINE_H
 
     return y + height
 
 
-def draw_pill(
+def draw_lesson_pill(
     draw: ImageDraw.ImageDraw,
     x: int,
     y: int,
@@ -248,15 +354,34 @@ def draw_pill(
     width: int,
     fonts: "FontSet",
 ) -> None:
-    draw.rounded_rectangle((x, y, x + width, y + 38), radius=19, fill=(255, 255, 255), outline=(219, 228, 242), width=1)
+    draw.rounded_rectangle(
+        (x, y, x + width, y + PILL_H),
+        radius=19,
+        fill=CHIP_BLUE,
+        outline=(213, 224, 248),
+        width=1,
+    )
+    draw.ellipse((x + 15, y + 14, x + 25, y + 24), fill=BLUE)
+    draw.text((x + 36, y + 7), text, font=fonts.semibold(22), fill=(28, 64, 158))
+
+
+def draw_room_pill(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    text: str,
+    width: int,
+    fonts: "FontSet",
+) -> None:
+    draw.rounded_rectangle(
+        (x, y, x + width, y + PILL_H),
+        radius=19,
+        fill=(255, 255, 255),
+        outline=(219, 228, 242),
+        width=1,
+    )
     draw.ellipse((x + 15, y + 14, x + 25, y + 24), fill=GOLD)
-    if " - " in text:
-        lesson_text, room_text = text.split(" - ", 1)
-        draw.text((x + 36, y + 7), lesson_text, font=fonts.semibold(22), fill=INK)
-        lesson_w = text_width(lesson_text, fonts.semibold(22))
-        draw.text((x + 46 + lesson_w, y + 7), room_text, font=fonts.semibold(22), fill=BLUE)
-    else:
-        draw.text((x + 36, y + 7), text, font=fonts.semibold(22), fill=BLUE)
+    draw.text((x + 36, y + 7), text, font=fonts.bold(22), fill=INK)
 
 
 def draw_empty_state(draw: ImageDraw.ImageDraw, fonts: "FontSet", y: int) -> int:
@@ -278,28 +403,6 @@ def draw_footer(draw: ImageDraw.ImageDraw, height: int, fonts: "FontSet") -> Non
     footer = "kabinet-navigator-bot"
     footer_w = text_width(footer, fonts.semibold(22))
     draw.text((CONTENT_X + CONTENT_W - footer_w, y), footer, font=fonts.semibold(22), fill=BLUE)
-
-
-def layout_pills(
-    details: list[str],
-    font: ImageFont.FreeTypeFont,
-    max_width: int,
-) -> list[list[tuple[str, int]]]:
-    lines: list[list[tuple[str, int]]] = []
-    current: list[tuple[str, int]] = []
-    current_width = 0
-    for detail in details:
-        width = min(max_width, text_width(detail, font) + 36)
-        next_width = width if not current else current_width + 10 + width
-        if current and next_width > max_width:
-            lines.append(current)
-            current = []
-            current_width = 0
-        current.append((detail, width))
-        current_width = width if current_width == 0 else current_width + 10 + width
-    if current:
-        lines.append(current)
-    return lines or [[("пары не указаны", text_width("пары не указаны", font) + 36)]]
 
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
@@ -363,6 +466,23 @@ def lerp_color(start: tuple[int, int, int], end: tuple[int, int, int], t: float)
 def text_width(text: str, font: ImageFont.FreeTypeFont) -> int:
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0]
+
+
+def fit_font(
+    loader,
+    text: str,
+    max_size: int,
+    min_size: int,
+    max_width: int,
+    step: int = 2,
+) -> ImageFont.FreeTypeFont:
+    size = max_size
+    while size > min_size:
+        font = loader(size)
+        if text_width(text, font) <= max_width:
+            return font
+        size -= step
+    return loader(min_size)
 
 
 class FontSet:
