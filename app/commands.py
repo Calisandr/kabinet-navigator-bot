@@ -3,6 +3,7 @@ from __future__ import annotations
 
 COMMANDS = [
     {"command": "start", "description": "открыть меню"},
+    {"command": "yesterday", "description": "расписание на вчера"},
     {"command": "today", "description": "расписание на сегодня"},
     {"command": "tomorrow", "description": "расписание на завтра"},
     {"command": "next", "description": "ближайшие даты"},

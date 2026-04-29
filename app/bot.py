@@ -26,6 +26,7 @@ from telegram.ext import (
 from .commands import COMMANDS
 from .config import Settings, load_settings
 from .formatting import (
+    format_date,
     format_day_schedule,
     format_next_dates,
     format_short_date,
@@ -34,6 +35,7 @@ from .formatting import (
     split_long_message,
 )
 from .schedule import GoogleSheetScheduleRepository, Schedule
+from .schedule_image import render_day_schedule_image
 
 
 logging.basicConfig(
@@ -44,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Сегодня", "Завтра"],
+        ["Вчера", "Сегодня", "Завтра"],
         ["Ближайшие даты", "Найти преподавателя"],
         ["Все преподаватели", "Обновить"],
     ],
@@ -98,7 +100,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я показываю, кто из преподавателей в каком компьютерном кабинете находится "
         "по данным Google Таблицы.\n\n"
         "Можно нажать кнопку или просто отправить фамилию: <code>Григорьев</code>.\n"
-        "Для даты подходит формат: <code>02.05.2026</code>."
+        "Для даты подходит формат: <code>02.05.2026</code>, а еще слова "
+        "<code>вчера</code>, <code>сегодня</code>, <code>завтра</code>."
     )
     await update.effective_message.reply_text(
         text,
@@ -114,6 +117,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/tomorrow - расписание на завтра\n"
         "/next - ближайшие даты из таблицы\n"
         "/date 02.05.2026 - расписание на дату\n"
+        "/date завтра - расписание на относительную дату\n"
         "/teacher Короткова - поиск преподавателя\n"
         "/teachers - список преподавателей и событий\n"
         "/refresh - обновить данные из таблицы"
@@ -129,6 +133,10 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await send_date_schedule(update, context, today_for(context))
 
 
+async def yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_date_schedule(update, context, today_for(context) - timedelta(days=1))
+
+
 async def tomorrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_date_schedule(update, context, today_for(context) + timedelta(days=1))
 
@@ -138,7 +146,8 @@ async def date_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     target = parse_user_date(raw, today_for(context))
     if target is None:
         await update.effective_message.reply_text(
-            "Напиши дату после команды, например: <code>/date 02.05.2026</code>",
+            "Напиши дату после команды, например: <code>/date 02.05.2026</code> "
+            "или <code>/date завтра</code>.",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_KEYBOARD,
         )
@@ -183,12 +192,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "").strip()
     lowered = text.casefold()
 
-    if lowered == "сегодня":
-        await send_date_schedule(update, context, today_for(context))
-        return
-    if lowered == "завтра":
-        await send_date_schedule(update, context, today_for(context) + timedelta(days=1))
-        return
+    if lowered in {"вчера", "сегодня", "завтра"}:
+        target = parse_user_date(text, today_for(context))
+        if target:
+            await send_date_schedule(update, context, target)
+            return
     if lowered == "ближайшие даты":
         await send_next_dates(update, context)
         return
@@ -240,11 +248,33 @@ async def send_date_schedule(
     from_callback: bool = False,
 ) -> None:
     schedule = await get_cache(context).get()
-    text = format_day_schedule(target, schedule.entries_for_date(target))
+    entries = schedule.entries_for_date(target)
+    text = format_day_schedule(target, entries)
     if from_callback and update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        await send_day_schedule_image(update, target, entries, text, reply_markup=None)
         return
-    await reply_split(update, text)
+    await send_day_schedule_image(update, target, entries, text, reply_markup=MAIN_KEYBOARD)
+
+
+async def send_day_schedule_image(
+    update: Update,
+    target: date,
+    entries,
+    fallback_text: str,
+    reply_markup=None,
+) -> None:
+    try:
+        image = await asyncio.to_thread(render_day_schedule_image, target, entries)
+        caption = f"Расписание на {format_date(target)}"
+        await update.effective_message.reply_photo(
+            photo=image,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+        return
+    except Exception:
+        LOGGER.exception("Failed to render or send schedule image")
+    await reply_split(update, fallback_text)
 
 
 async def send_teacher_schedule(
@@ -282,6 +312,14 @@ async def reply_split(update: Update, text: str) -> None:
 
 def parse_user_date(raw: str, today: date) -> date | None:
     text = raw.strip()
+    lowered = text.casefold()
+    if lowered == "вчера":
+        return today - timedelta(days=1)
+    if lowered == "сегодня":
+        return today
+    if lowered == "завтра":
+        return today + timedelta(days=1)
+
     match = re.fullmatch(r"([0-3]?\d)[./-]([01]?\d)(?:[./-](\d{2,4}))?", text)
     if not match:
         return None
@@ -318,6 +356,7 @@ def build_application(settings: Settings) -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("yesterday", yesterday_command))
     application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("tomorrow", tomorrow_command))
     application.add_handler(CommandHandler("date", date_command))
