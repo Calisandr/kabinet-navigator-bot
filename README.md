@@ -12,6 +12,7 @@ Telegram-бот для расписания компьютерных кабин�
 - Ищет преподавателя по фамилии или части ФИО.
 - Показывает список всех преподавателей и событий.
 - Обновляет данные командой `/refresh`.
+- Показывает статистику пользователей командой `/stats`.
 - Принимает дату текстом: `02.05.2026`.
 
 В исходной таблице нет отдельной колонки с предметом, поэтому бот показывает номер пары и кабинет. Если в таблицу добавят предмет отдельной колонкой, парсер можно расширить.
@@ -34,6 +35,11 @@ BOT_TIMEZONE=Asia/Krasnoyarsk
 CACHE_MINUTES=15
 WEBHOOK_SECRET=change_me_to_a_random_secret
 WEBHOOK_URL=https://your-vercel-domain.vercel.app
+ADMIN_USER_IDS=
+USER_STATS_DB_PATH=.data/user_stats.sqlite3
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+USER_STATS_KEY_PREFIX=kabinet_navigator
 ```
 
 Запуск:
@@ -79,6 +85,10 @@ GOOGLE_SHEET_ID=14inaoG-X5D6U3pLb1o0n3PwpZkSSlxGwoNlb6wVsU0Q
 BOT_TIMEZONE=Asia/Krasnoyarsk
 CACHE_MINUTES=15
 WEBHOOK_SECRET=любая_случайная_строка
+ADMIN_USER_IDS=123456789
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+USER_STATS_KEY_PREFIX=kabinet_navigator
 ```
 
 3. Сделай Deploy.
@@ -101,6 +111,36 @@ python -m app.bot
 python -m scripts.set_commands
 ```
 
+## Статистика пользователей
+
+Бот считает уникальных пользователей по Telegram `user_id` и показывает общее количество пользователей за все время, а также количество активных сегодня.
+
+Команда:
+
+```text
+/stats
+```
+
+Если `ADMIN_USER_IDS` пустой, команду может вызвать любой пользователь. Чтобы ограничить доступ, укажи один или несколько Telegram ID администраторов через запятую:
+
+```env
+ADMIN_USER_IDS=123456789,987654321
+```
+
+При локальном запуске или worker-хостинге статистика хранится в SQLite-файле:
+
+```env
+USER_STATS_DB_PATH=.data/user_stats.sqlite3
+```
+
+На Vercel файловая статистика не подходит для постоянного учета между перезапусками функций. Для Vercel подключи Upstash Redis и добавь переменные:
+
+```env
+UPSTASH_REDIS_REST_URL=https://...
+UPSTASH_REDIS_REST_TOKEN=...
+USER_STATS_KEY_PREFIX=kabinet_navigator
+```
+
 ## Команды бота
 
 - `/start` - открыть меню.
@@ -112,3 +152,4 @@ python -m scripts.set_commands
 - `/teacher Короткова` - поиск преподавателя.
 - `/teachers` - список преподавателей и событий.
 - `/refresh` - обновить таблицу.
+- `/stats` - статистика пользователей.

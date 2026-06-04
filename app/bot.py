@@ -20,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -36,6 +37,7 @@ from .formatting import (
 )
 from .schedule import GoogleSheetScheduleRepository, Schedule
 from .schedule_image import render_day_schedule_image
+from .stats import UserStatsStore, build_user_stats_store
 
 
 logging.basicConfig(
@@ -85,6 +87,10 @@ def get_settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
     return context.application.bot_data["settings"]
 
 
+def get_user_stats_store(context: ContextTypes.DEFAULT_TYPE) -> UserStatsStore:
+    return context.application.bot_data["user_stats_store"]
+
+
 def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
     timezone_name = get_settings(context).timezone
     try:
@@ -92,6 +98,17 @@ def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
     except ZoneInfoNotFoundError:
         timezone = ZoneInfo("UTC")
     return datetime.now(timezone).date()
+
+
+async def track_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    try:
+        await get_user_stats_store(context).record_user(user.id, today_for(context))
+    except Exception:
+        LOGGER.exception("Failed to record user stats")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -186,6 +203,35 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"дат: <b>{len(schedule.dates)}</b>."
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = get_settings(context)
+    user = update.effective_user
+    if settings.admin_user_ids and (user is None or user.id not in settings.admin_user_ids):
+        await update.effective_message.reply_text(
+            "Команда доступна только администратору.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    stats = await get_user_stats_store(context).get_stats(today_for(context))
+    text = (
+        "<b>Статистика бота</b>\n\n"
+        f"Всего пользователей: <b>{stats.total_users}</b>\n"
+        f"Активны сегодня: <b>{stats.active_today}</b>\n"
+        f"Хранилище: <code>{stats.storage_name}</code>"
+    )
+    if not stats.is_persistent:
+        text += (
+            "\n\nСтатистика хранится только в памяти процесса. "
+            "Для постоянного учета на Vercel подключи Upstash Redis."
+        )
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KEYBOARD,
+    )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -353,7 +399,9 @@ def build_application(settings: Settings) -> Application:
     application = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
     application.bot_data["settings"] = settings
     application.bot_data["schedule_cache"] = cache
+    application.bot_data["user_stats_store"] = build_user_stats_store(settings)
 
+    application.add_handler(TypeHandler(Update, track_usage), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("yesterday", yesterday_command))
@@ -364,6 +412,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("teachers", teachers_command))
     application.add_handler(CommandHandler("next", next_command))
     application.add_handler(CommandHandler("refresh", refresh_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return application

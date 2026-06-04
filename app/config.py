@@ -17,6 +17,26 @@ class Settings:
     cache_minutes: int
     webhook_secret: str
     webhook_url: str
+    admin_user_ids: frozenset[int]
+    user_stats_db_path: str
+    upstash_redis_rest_url: str
+    upstash_redis_rest_token: str
+    user_stats_key_prefix: str
+
+
+def parse_admin_user_ids(raw: str) -> frozenset[int]:
+    ids: set[int] = set()
+    for item in raw.replace(";", ",").split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            ids.add(int(value))
+        except ValueError as exc:
+            raise RuntimeError(
+                "ADMIN_USER_IDS must contain Telegram numeric user IDs separated by commas."
+            ) from exc
+    return frozenset(ids)
 
 
 def load_settings() -> Settings:
@@ -43,4 +63,10 @@ def load_settings() -> Settings:
         cache_minutes=cache_minutes,
         webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip(),
         webhook_url=os.getenv("WEBHOOK_URL", "").strip(),
+        admin_user_ids=parse_admin_user_ids(os.getenv("ADMIN_USER_IDS", "")),
+        user_stats_db_path=os.getenv("USER_STATS_DB_PATH", ".data/user_stats.sqlite3").strip(),
+        upstash_redis_rest_url=os.getenv("UPSTASH_REDIS_REST_URL", "").strip(),
+        upstash_redis_rest_token=os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip(),
+        user_stats_key_prefix=os.getenv("USER_STATS_KEY_PREFIX", "kabinet_navigator").strip()
+        or "kabinet_navigator",
     )
