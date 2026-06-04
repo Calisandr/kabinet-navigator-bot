@@ -220,15 +220,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     stats = await get_user_stats_store(context).get_stats(today_for(context))
     text = (
         "<b>Статистика бота</b>\n\n"
-        f"Всего пользователей: <b>{stats.total_users}</b>\n"
-        f"Активны сегодня: <b>{stats.active_today}</b>\n"
-        f"Хранилище: <code>{stats.storage_name}</code>"
+        f"Пользователей: <b>{stats.total_users}</b>"
     )
-    if not stats.is_persistent:
-        text += (
-            "\n\nСтатистика хранится только в памяти процесса. "
-            "Для постоянного учета на Vercel подключи Upstash Redis."
-        )
     await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
