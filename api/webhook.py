@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application
 
-from app.bot import build_application
+from app.bot import build_application, set_bot_commands
 from app.config import Settings, load_settings
 
 
@@ -83,6 +83,7 @@ async def get_application() -> Application:
     if _application is None:
         _application = build_application(get_settings())
         await _application.initialize()
+        await set_bot_commands(_application)
     return _application
 
 

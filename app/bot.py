@@ -385,10 +385,14 @@ def parse_user_date(raw: str, today: date) -> date | None:
         return None
 
 
-async def post_init(application: Application) -> None:
+async def set_bot_commands(application: Application) -> None:
     await application.bot.set_my_commands(
         [BotCommand(item["command"], item["description"]) for item in COMMANDS]
     )
+
+
+async def post_init(application: Application) -> None:
+    await set_bot_commands(application)
 
 
 def build_application(settings: Settings) -> Application:
