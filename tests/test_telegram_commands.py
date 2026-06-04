@@ -4,15 +4,15 @@ import asyncio
 
 import api.webhook as webhook
 from app.bot import set_bot_commands
-from app.commands import COMMANDS
+from app.commands import COMMANDS, build_set_my_commands_payloads
 
 
 class FakeBot:
     def __init__(self) -> None:
-        self.commands = None
+        self.calls = []
 
-    async def set_my_commands(self, commands) -> None:
-        self.commands = commands
+    async def set_my_commands(self, commands, **kwargs) -> None:
+        self.calls.append((commands, kwargs))
 
 
 class FakeApplication:
@@ -36,9 +36,30 @@ def test_stats_command_is_registered_for_telegram_suggestions() -> None:
 
     asyncio.run(set_bot_commands(application))
 
-    command_names = [command.command for command in application.bot.commands]
-    assert command_names == [item["command"] for item in COMMANDS]
-    assert "stats" in command_names
+    assert len(application.bot.calls) == len(build_set_my_commands_payloads())
+    for commands, kwargs in application.bot.calls:
+        command_names = [command.command for command in commands]
+        assert command_names == [item["command"] for item in COMMANDS]
+        assert "stats" in command_names
+
+    scope_types = {kwargs["scope"].type for _, kwargs in application.bot.calls}
+    language_codes = {kwargs.get("language_code") for _, kwargs in application.bot.calls}
+    assert scope_types == {"default", "all_private_chats"}
+    assert language_codes == {None, "ru"}
+
+
+def test_set_my_commands_payloads_cover_desktop_and_mobile_clients() -> None:
+    payloads = build_set_my_commands_payloads()
+
+    assert len(payloads) == 4
+    assert {payload["scope"]["type"] for payload in payloads} == {
+        "default",
+        "all_private_chats",
+    }
+    assert {payload.get("language_code") for payload in payloads} == {None, "ru"}
+    for payload in payloads:
+        command_names = [item["command"] for item in payload["commands"]]
+        assert "stats" in command_names
 
 
 def test_webhook_initialization_registers_bot_commands(monkeypatch) -> None:

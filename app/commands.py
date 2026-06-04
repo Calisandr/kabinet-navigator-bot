@@ -14,3 +14,20 @@ COMMANDS = [
     {"command": "stats", "description": "статистика пользователей"},
     {"command": "help", "description": "помощь"},
 ]
+
+COMMAND_SCOPE_TYPES = ("default", "all_private_chats")
+COMMAND_LANGUAGE_CODES = (None, "ru")
+
+
+def build_set_my_commands_payloads() -> list[dict[str, object]]:
+    payloads = []
+    for scope_type in COMMAND_SCOPE_TYPES:
+        for language_code in COMMAND_LANGUAGE_CODES:
+            payload: dict[str, object] = {
+                "commands": COMMANDS,
+                "scope": {"type": scope_type},
+            }
+            if language_code is not None:
+                payload["language_code"] = language_code
+            payloads.append(payload)
+    return payloads

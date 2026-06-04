@@ -5,7 +5,7 @@ import sys
 import requests
 
 from app.config import load_settings
-from app.commands import COMMANDS
+from app.commands import build_set_my_commands_payloads
 
 
 def main() -> None:
@@ -35,19 +35,28 @@ def main() -> None:
     )
     set_webhook.raise_for_status()
 
-    set_commands = requests.post(
-        f"{api_base}/setMyCommands",
-        json={"commands": COMMANDS},
-        timeout=30,
-    )
-    set_commands.raise_for_status()
+    set_commands_results = []
+    for payload in build_set_my_commands_payloads():
+        set_commands = requests.post(
+            f"{api_base}/setMyCommands",
+            json=payload,
+            timeout=30,
+        )
+        set_commands.raise_for_status()
+        set_commands_results.append(
+            {
+                "scope": payload.get("scope"),
+                "language_code": payload.get("language_code"),
+                "result": set_commands.json(),
+            }
+        )
 
     info = requests.get(f"{api_base}/getWebhookInfo", timeout=30)
     info.raise_for_status()
 
     print("Webhook URL:", webhook_url)
     print("setWebhook:", set_webhook.json())
-    print("setMyCommands:", set_commands.json())
+    print("setMyCommands:", set_commands_results)
     print("getWebhookInfo:", info.json())
 
 

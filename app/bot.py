@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
     BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -24,7 +26,7 @@ from telegram.ext import (
     filters,
 )
 
-from .commands import COMMANDS
+from .commands import COMMANDS, COMMAND_LANGUAGE_CODES, COMMAND_SCOPE_TYPES
 from .config import Settings, load_settings
 from .formatting import (
     format_date,
@@ -386,9 +388,17 @@ def parse_user_date(raw: str, today: date) -> date | None:
 
 
 async def set_bot_commands(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [BotCommand(item["command"], item["description"]) for item in COMMANDS]
-    )
+    commands = [BotCommand(item["command"], item["description"]) for item in COMMANDS]
+    scopes = {
+        "default": BotCommandScopeDefault(),
+        "all_private_chats": BotCommandScopeAllPrivateChats(),
+    }
+    for scope_type in COMMAND_SCOPE_TYPES:
+        for language_code in COMMAND_LANGUAGE_CODES:
+            kwargs = {"scope": scopes[scope_type]}
+            if language_code is not None:
+                kwargs["language_code"] = language_code
+            await application.bot.set_my_commands(commands, **kwargs)
 
 
 async def post_init(application: Application) -> None:
