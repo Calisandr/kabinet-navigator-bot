@@ -51,6 +51,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         ["Вчера", "Сегодня", "Завтра"],
         ["Ближайшие даты", "Найти преподавателя"],
         ["Все преподаватели", "Обновить"],
+        ["Статистика"],
     ],
     resize_keyboard=True,
     input_field_placeholder="Введите фамилию или дату",
@@ -137,7 +138,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/date завтра - расписание на относительную дату\n"
         "/teacher Короткова - поиск преподавателя\n"
         "/teachers - список преподавателей и событий\n"
-        "/refresh - обновить данные из таблицы"
+        "/refresh - обновить данные из таблицы\n"
+        "/stats - статистика пользователей"
     )
     await update.effective_message.reply_text(
         text,
@@ -258,6 +260,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if lowered == "обновить":
         await refresh_command(update, context)
+        return
+    if lowered == "статистика":
+        await stats_command(update, context)
         return
 
     parsed_date = parse_user_date(text, today_for(context))
