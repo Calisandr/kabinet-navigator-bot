@@ -220,7 +220,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     stats = await get_user_stats_store(context).get_stats(today_for(context))
     text = (
         "<b>Статистика бота</b>\n\n"
-        f"Пользователей: <b>{stats.total_users}</b>"
+        f"Пользователей: <b>{stats.total_users}</b>\n"
+        f"Активны за последние 15 минут: <b>{stats.active_now}</b>"
     )
     await update.effective_message.reply_text(
         text,

@@ -20,6 +20,7 @@ def test_sqlite_user_stats_counts_unique_users(tmp_path) -> None:
 
     assert stats.total_users == 2
     assert stats.active_today == 2
+    assert stats.active_now == 2
     assert stats.storage_name == "sqlite"
     assert stats.is_persistent is True
 
