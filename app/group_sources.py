@@ -208,6 +208,31 @@ def pick_sources(
     return tuple(result)
 
 
+def pick_sources_in_range(
+    sources: Iterable[GroupScheduleSource], start: date, end: date
+) -> tuple[GroupScheduleSource, ...]:
+    """Select an intersecting publication per category without a date fallback.
+
+    The original document period is preserved. Prefer an exact published period,
+    then the most requested days, latest period and last catalogue entry.
+    This selects a publication, not individual lessons or a synthetic timetable.
+    """
+    if type(start) is not date or type(end) is not date or not 0 <= (end - start).days < 31:
+        raise ValueError("The requested schedule period must contain 1 to 31 days")
+    candidates: dict[str, list[tuple[bool, int, date, int, GroupScheduleSource]]] = {}
+    for index, source in enumerate(sources):
+        first, last = max(source.start, start), min(source.end, end)
+        if first <= last:
+            candidates.setdefault(source.category, []).append((
+                source.start == start and source.end == end,
+                (last - first).days + 1, source.start, index, source,
+            ))
+    return tuple(
+        max(candidates[category], key=lambda item: item[:4])[4]
+        for category in ("vo", "spo", "part_time") if category in candidates
+    )
+
+
 class GroupScheduleRepository:
     def __init__(
         self,

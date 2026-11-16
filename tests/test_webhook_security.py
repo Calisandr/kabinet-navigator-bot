@@ -20,6 +20,7 @@ from app import bot as bot_module
 from app.config import Settings
 from app.group_schedule import GroupOption, GroupTimetable
 from app.group_sources import GroupScheduleSource
+from app.preferences import MemoryUserPreferencesStore, SavedGroup
 from app.schedule import Schedule, ScheduleEntry
 from app.stats import MemoryUserStatsStore
 
@@ -46,14 +47,14 @@ def message_payload(command="/start", *, update_id=1, user_id=9001):
     return {"update_id": update_id, "message": message}
 
 
-def callback_payload(data="date:2026-11-16", *, update_id=2):
-    message = message_payload()["message"]
+def callback_payload(data="date:2026-11-16", *, update_id=2, user_id=9001):
+    message = message_payload(user_id=user_id)["message"]
     message["from"] = {"id": 123456, "is_bot": True, "first_name": "Offline Bot"}
     return {
         "update_id": update_id,
         "callback_query": {
             "id": f"query-{update_id}", "chat_instance": "offline-instance",
-            "from": {"id": 9001, "is_bot": False, "first_name": "Offline User"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Offline User"},
             "message": message, "data": data,
         },
     }
@@ -302,6 +303,7 @@ def test_failed_delivery_is_retried_instead_of_marked_completed(monkeypatch, htt
 class FakeTelegramRequest(BaseRequest):
     def __init__(self):
         self.calls = []
+        self.requests = []
 
     @property
     def read_timeout(self):
@@ -316,6 +318,11 @@ class FakeTelegramRequest(BaseRequest):
     async def do_request(self, url, method, request_data=None, **kwargs):
         endpoint = url.rsplit("/", 1)[-1]
         self.calls.append(endpoint)
+        self.requests.append({
+            "endpoint": endpoint,
+            "parameters": request_data.parameters if request_data is not None else {},
+            "contains_files": bool(request_data is not None and request_data.contains_files),
+        })
         if endpoint == "getMe":
             result = {"id": 123456, "is_bot": True, "first_name": "Offline Bot", "username": "offline_bot"}
         elif endpoint in {"sendMessage", "sendPhoto"}:
@@ -331,8 +338,11 @@ def application_transport(monkeypatch):
     builder = Application.builder().request(transport).get_updates_request(FakeTelegramRequest())
     monkeypatch.setattr(Application, "builder", lambda: builder)
     monkeypatch.setattr(bot_module, "build_user_stats_store", lambda _: MemoryUserStatsStore())
+    monkeypatch.setattr(bot_module, "build_user_preferences_store", lambda _: MemoryUserPreferencesStore())
     application = bot_module.build_application(SETTINGS)
-    today = datetime.now(timezone.utc).date()
+    today = date(2026, 11, 16)
+    monkeypatch.setattr(bot_module, "today_for", lambda _: today)
+    monkeypatch.setattr("app.group_bot.local_today", lambda _: today)
     schedule = Schedule(
         entries=(ScheduleEntry(today, "Offline Teacher", "1", "219", "Offline", 1),),
         loaded_at=datetime.now(),
@@ -344,12 +354,27 @@ def application_transport(monkeypatch):
     output = io.BytesIO()
     with Image.new("RGB", (32, 32), "white") as image:
         image.save(output, "PNG")
-    source = GroupScheduleSource("Offline timetable", "spo", "https://www.prk.kuzstu.ru/upload/offline.pdf", today, today + timedelta(days=6))
+    monday = today - timedelta(days=today.weekday())
+    source = GroupScheduleSource("Offline timetable", "spo", "https://www.prk.kuzstu.ru/upload/offline.pdf", monday, monday + timedelta(days=6))
+    transport.group_requests = []
+    transport.period_requests = []
     class FakeGroupService:
         def list_groups(self, *args, **kwargs):
             return (GroupOption("ИСт-241.2", "spo", "СПО", source.start, source.end),)
+        def list_periods(self, *args, **kwargs):
+            transport.period_requests.append((args, kwargs))
+            return tuple(
+                GroupScheduleSource(
+                    "Offline published week", "spo", f"https://www.prk.kuzstu.ru/upload/offline-{offset}.pdf",
+                    monday + timedelta(weeks=offset), monday + timedelta(weeks=offset, days=6),
+                ) for offset in (1, 0, -1)
+            )
         def get_timetable(self, *args, **kwargs):
-            return GroupTimetable("ИСт-241.2", source, (io.BytesIO(output.getvalue()),))
+            transport.group_requests.append((args, kwargs))
+            start = kwargs.get("period_start") or source.start
+            end = kwargs.get("period_end") or start + timedelta(days=6)
+            selected_source = GroupScheduleSource(source.title, source.category, source.url, start, end)
+            return GroupTimetable("ИСт-241.2", selected_source, (io.BytesIO(output.getvalue()),))
     application.bot_data["group_schedule_service"] = FakeGroupService()
     monkeypatch.setattr(webhook, "build_application", lambda _: application)
     return transport
@@ -359,6 +384,7 @@ def test_all_existing_commands_cross_real_http_to_real_ptb_handlers_without_exte
     commands = (
         "/start", "/help", "/today", "/tomorrow", "/yesterday", "/next", "/date завтра",
         "/teacher Offline", "/teachers", "/refresh", "/stats", "/groups спо", "/group ИСт-241.2",
+        "/mygroup", "/week", "/week next",
     )
     for update_id, command in enumerate(commands, 200):
         before = len(application_transport.calls)
@@ -375,6 +401,87 @@ def test_callback_flow_crosses_http_and_keeps_group_button_and_date_button_worki
         assert status == 200 and body == {"ok": True}
     assert application_transport.calls.count("answerCallbackQuery") == 2
     assert "sendPhoto" in application_transport.calls
+
+
+def test_saved_group_and_published_week_flow_cross_real_http_and_ptb_without_network(
+    monkeypatch, http_server, application_transport,
+):
+    def external_network_forbidden(*_args, **_kwargs):
+        pytest.fail("The HTTP E2E flow must not reach external document or storage services")
+    monkeypatch.setattr("requests.sessions.Session.request", external_network_forbidden)
+    transport = application_transport
+    update_id = 600
+
+    def deliver(value, *, callback=False, user_id=9001):
+        nonlocal update_id
+        update_id += 1
+        before = len(transport.requests)
+        payload = callback_payload(value, update_id=update_id, user_id=user_id) if callback else message_payload(
+            value, update_id=update_id, user_id=user_id,
+        )
+        status, body, _ = post(http_server, payload)
+        assert status == 200 and body == {"ok": True}
+        return transport.requests[before:]
+
+    def photos(requests):
+        return [item for item in requests if item["endpoint"] == "sendPhoto"]
+
+    def texts(requests):
+        return [item["parameters"].get("text", "") for item in requests if item["endpoint"] == "sendMessage"]
+
+    first = deliver("/group ИСт-241.2")
+    assert len(photos(first)) == 1
+    photo = photos(first)[0]
+    assert photo["contains_files"]
+    assert "Оригинальное расписание (PDF)" in photo["parameters"]["caption"]
+    buttons = photo["parameters"]["reply_markup"]["inline_keyboard"]
+    assert any(button.get("callback_data") == "gf:s:ИСт-241.2" for row in buttons for button in row)
+
+    saved = deliver("gf:s:ИСт-241.2", callback=True)
+    assert any("ваша группа" in text for text in texts(saved))
+    store = webhook._application.bot_data["user_preferences_store"]
+    assert asyncio.run(store.get_group(9001)) == SavedGroup("ИСт-241.2", "spo")
+    assert asyncio.run(store.get_group(9002)) is None
+
+    # The next Telegram update creates a fresh CallbackContext. Discard all
+    # transient user_data as well: saved navigation must use the store.
+    webhook._application.user_data[9001].clear()
+    reopened = deliver("/mygroup")
+    assert len(photos(reopened)) == 1
+    assert transport.group_requests[-1][1]["category"] == "spo"
+
+    next_week = deliver("/week next")
+    assert len(photos(next_week)) == 1
+    current_monday = date(2026, 11, 16)
+    start, end = current_monday + timedelta(days=7), current_monday + timedelta(days=13)
+    assert transport.group_requests[-1][1] == {"category": "spo", "period_start": start, "period_end": end}
+    assert f"Запрошено: {start:%d.%m.%Y} — {end:%d.%m.%Y}" in photos(next_week)[0]["parameters"]["caption"]
+
+    selector = deliver("gp:s:0:ИСт-241.2", callback=True)
+    assert transport.period_requests[-1][1] == {"category": "spo"}
+    selector_messages = [item for item in selector if item["endpoint"] == "sendMessage"]
+    assert any("Период для группы" in text for text in texts(selector))
+    period_buttons = selector_messages[-1]["parameters"]["reply_markup"]["inline_keyboard"]
+    selected = f"gk:s:{start:%Y%m%d}:{end:%Y%m%d}:ИСт-241.2"
+    assert any(button.get("callback_data") == selected for row in period_buttons for button in row)
+    selected_week = deliver(selected, callback=True)
+    assert len(photos(selected_week)) == 1
+    assert transport.group_requests[-1][1] == {"category": "spo", "period_start": start, "period_end": end}
+
+    # A second student's update cannot read or clear the first student's saved
+    # group, and removal by the first leaves the second preference intact.
+    isolated = deliver("/mygroup", user_id=9002)
+    assert not photos(isolated)
+    assert any("пока не закреплена" in text for text in texts(isolated))
+    deliver("gf:s:ИСт-241.2", callback=True, user_id=9002)
+    removed = deliver("gx", callback=True)
+    assert any("Группа откреплена" in text for text in texts(removed))
+    assert asyncio.run(store.get_group(9001)) is None
+    assert asyncio.run(store.get_group(9002)) == SavedGroup("ИСт-241.2", "spo")
+    no_saved = deliver("/mygroup")
+    assert not photos(no_saved)
+    assert any("пока не закреплена" in text for text in texts(no_saved))
+    assert "sendMediaGroup" not in transport.calls
 
 
 @pytest.mark.parametrize("command", ["/start", "/today", "/group ИСт-241.2"])
