@@ -203,8 +203,12 @@ async def _send_group_timetable(update, context, query: str, *, category: str | 
             asyncio.to_thread(service.get_timetable, query, today, category=category, period_start=period_start),
             timeout=GROUP_REQUEST_TIMEOUT_SECONDS,
         )
-        if not timetable.images:
-            raise GroupScheduleError("В опубликованном документе не удалось подготовить изображение группы.")
+        if len(timetable.images) != 1:
+            raise GroupScheduleError(
+                "Не удалось подготовить единое изображение группы на весь период. "
+                "Откройте оригинальное расписание по ссылке ниже.",
+                source_url=timetable.source.url,
+            )
     except Exception as exc:
         await _send_error(update, exc, query=query)
         return
@@ -223,15 +227,14 @@ async def _send_group_timetable(update, context, query: str, *, category: str | 
         [[InlineKeyboardButton("Группы этого периода", callback_data=f"gw:{source.category}:{source.start:%Y%m%d}:0")]]
     )
     try:
-        for index, image in enumerate(timetable.images, start=1):
-            image.seek(0)
-            part = f"\nФрагмент {index} из {len(timetable.images)}." if len(timetable.images) > 1 else ""
-            await message.reply_photo(
-                photo=image,
-                caption=caption + part,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup if index == len(timetable.images) else None,
-            )
+        image = timetable.images[0]
+        image.seek(0)
+        await message.reply_photo(
+            photo=image,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
     except Exception as exc:
         LOGGER.warning("Group timetable image could not be sent (%s)", type(exc).__name__)
         await message.reply_text(

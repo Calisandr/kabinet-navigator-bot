@@ -9,6 +9,8 @@ from datetime import date
 from difflib import get_close_matches
 from io import BytesIO
 
+from PIL import Image
+
 from .group_pdf import GroupLocation, UnsupportedTimetableError, extract_groups, normalize_group, render_group
 from .group_sources import (
     GROUP_SCHEDULE_PAGE_URL,
@@ -21,6 +23,50 @@ from .group_sources import (
 
 LOGGER = logging.getLogger(__name__)
 MAX_GROUP_IMAGES = 12
+MAX_COMBINED_PIXELS = 30_000_000
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
+
+def _single_week_image(images: tuple[BytesIO, ...], group: str) -> BytesIO:
+    """Keep all published group continuations in one Telegram-sized image."""
+    if not images or len(images) > MAX_GROUP_IMAGES:
+        raise UnsupportedTimetableError("Invalid number of group timetable images")
+    sizes: list[tuple[int, int]] = []
+    for content in images:
+        content.seek(0)
+        with Image.open(content) as image:
+            sizes.append(image.size)
+    if sum(width * height for width, height in sizes) > MAX_COMBINED_PIXELS:
+        raise UnsupportedTimetableError("The combined group timetable is too large")
+    width = max(size[0] for size in sizes)
+    height = sum(size[1] for size in sizes)
+    if width <= 0 or height <= 0 or max(width / height, height / width) > 20:
+        raise UnsupportedTimetableError("The combined timetable has unsupported proportions")
+    scale = min(1.0, 1600 / width, 8000 / height, 9900 / (width + height))
+    if len(images) == 1 and scale == 1.0 and images[0].getbuffer().nbytes < MAX_PHOTO_BYTES:
+        images[0].seek(0)
+        return images[0]
+    canvas = Image.new("RGB", (width, height), "white")
+    try:
+        top = 0
+        for content in images:
+            content.seek(0)
+            with Image.open(content) as image:
+                canvas.paste(image, ((width - image.width) // 2, top))
+                top += image.height
+        if scale < 1.0:
+            resized = canvas.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.LANCZOS)
+            canvas.close()
+            canvas = resized
+        result = BytesIO()
+        canvas.save(result, format="PNG", optimize=True)
+        if result.getbuffer().nbytes >= MAX_PHOTO_BYTES:
+            raise UnsupportedTimetableError("The weekly image exceeds the Telegram upload limit")
+        result.name = f"group-{normalize_group(group)}-week.png"
+        result.seek(0)
+        return result
+    finally:
+        canvas.close()
 
 
 class GroupScheduleError(RuntimeError):
@@ -214,9 +260,9 @@ class GroupScheduleService:
                 rendered.extend(render_group(content, location))
                 if len(rendered) > MAX_GROUP_IMAGES:
                     raise UnsupportedTimetableError("The group timetable has too many image fragments")
-            images = tuple(rendered)
-            if not images:
+            if not rendered:
                 raise UnsupportedTimetableError("No timetable images were produced")
+            images = (_single_week_image(tuple(rendered), matching_locations[0].group),)
         except (GroupSourceError, UnsupportedTimetableError, OSError) as exc:
             raise GroupScheduleError(
                 "Не удалось подготовить изображение группы. Оригинальное расписание доступно по ссылке ниже.",

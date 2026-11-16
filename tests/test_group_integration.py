@@ -145,7 +145,7 @@ def test_group_caption_with_long_official_pdf_url_stays_below_telegram_visible_l
         start=date(2026, 11, 14),
         end=date(2026, 11, 14),
     )
-    result = SimpleNamespace(group="ГМсозт-241.2.1.100", source=source, images=(BytesIO(b"image"),) * 3)
+    result = SimpleNamespace(group="ГМсозт-241.2.1.100", source=source, images=(BytesIO(b"image"),))
     message = SimpleNamespace(reply_text=AsyncMock(), reply_photo=AsyncMock())
     update = SimpleNamespace(effective_message=message)
     ctx = context()
@@ -155,14 +155,14 @@ def test_group_caption_with_long_official_pdf_url_stays_below_telegram_visible_l
 
     asyncio.run(group_bot.group_command(update, ctx))
 
-    assert message.reply_photo.await_count == 3
-    for call in message.reply_photo.await_args_list:
-        caption = call.kwargs["caption"]
-        visible = CaptionText()
-        visible.feed(caption)
-        assert len(visible.text.encode("utf-16-le")) // 2 <= 1024
-        assert "Оригинальное расписание (PDF)" in visible.text
-        assert source.url.replace("&", "&amp;") in caption
+    message.reply_photo.assert_awaited_once()
+    caption = message.reply_photo.await_args.kwargs["caption"]
+    visible = CaptionText()
+    visible.feed(caption)
+    assert len(visible.text.encode("utf-16-le")) // 2 <= 1024
+    assert "Оригинальное расписание (PDF)" in visible.text
+    assert source.url.replace("&", "&amp;") in caption
+    assert "Фрагмент 1 из" not in visible.text
 
 
 def test_long_unknown_group_input_returns_a_telegram_sized_error(monkeypatch):

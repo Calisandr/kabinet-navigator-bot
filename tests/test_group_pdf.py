@@ -46,6 +46,7 @@ def grid(verticals, horizontal, bottom, top):
 
 
 DAY_COLORS = [(0, 80 + i * 20, 255 - i * 18) for i in range(7)]
+HEADER_COLOR = (25, 60, 40)
 
 
 @pytest.fixture
@@ -58,6 +59,7 @@ def weekly_pdf():
             f"1 0 0 rg 110 {bottom} 215 {top-bottom} re f",
             f"{red/255:.5f} {green/255:.5f} {blue/255:.5f} rg 325 {bottom} 255 {top-bottom} re f",
         ]
+    content += [f"{HEADER_COLOR[0]/255:.5f} {HEADER_COLOR[1]/255:.5f} {HEADER_COLOR[2]/255:.5f} rg 325 930 255 20 re f"]
     content += ["0 0 0 rg", text(25, 940, "date", 8), text(65, 940, "time", 8)]
     content += [text(125, 940, "AC-231.2 / AC-241.2"), text(350, 940, "MX-231.2.1"), text(307, 940, "12", 8)]
     for index, top in enumerate(edges[:-1]):
@@ -100,7 +102,8 @@ def test_crop_excludes_neighbour_and_keeps_service_strip(weekly_pdf):
     location = next(item for item in extract_groups(weekly_pdf) if item.group == "MX-231.2.1")
     images = [Image.open(part).convert("RGB") for part in render_group(weekly_pdf, location)]
     try:
-        assert all(900 <= image.width <= 1044 and image.height <= 1500 for image in images)
+        assert len(images) == 1
+        assert all(900 <= image.width <= 1044 and image.height <= 8000 for image in images)
         all_colors = set()
         for image in images:
             all_colors.update(color for _, color in image.getcolors(image.width * image.height))
@@ -116,26 +119,38 @@ def test_crop_excludes_neighbour_and_keeps_service_strip(weekly_pdf):
             image.close()
 
 
-def test_week_is_split_only_at_day_boundaries_with_repeated_group_heading(weekly_pdf):
+def test_complete_week_is_one_image_with_all_days_and_a_single_header(weekly_pdf):
     location = next(item for item in extract_groups(weekly_pdf) if item.group == "MX-231.2.1")
     parts = render_group(weekly_pdf, location)
-    assert 2 <= len(parts) <= 4
-    images = [Image.open(part).convert("RGB") for part in parts]
-    try:
-        header = images[0].crop((16, 16, images[0].width - 16, 65)).tobytes()
-        for image in images[1:]:
-            assert image.crop((16, 16, image.width - 16, 65)).tobytes() == header
-        # Every source day appears in exactly one image, with no missing or
-        # duplicated coloured day panel at a split.
-        occurrences = {color: 0 for color in DAY_COLORS}
-        for image in images:
-            colors = {color for _, color in image.getcolors(image.width * image.height)}
-            for color in colors & occurrences.keys():
-                occurrences[color] += 1
-        assert set(occurrences.values()) == {1}
-    finally:
-        for image in images:
-            image.close()
+    assert len(parts) == 1
+    with Image.open(parts[0]) as image:
+        image = image.convert("RGB")
+        assert image.height > 1500  # A long week must not be divided at the old limit.
+        assert image.width + image.height <= group_pdf.MAX_PHOTO_DIMENSION_SUM
+        assert max(image.size) / min(image.size) <= group_pdf.MAX_PHOTO_ASPECT_RATIO
+        # Each source day occupies one continuous vertical band, in order.
+        # No repeated group header or missing day can separate its pixels.
+        pixels = image.load()
+        header_rows = [y for y in range(image.height) if pixels[image.width - 80, y] == HEADER_COLOR]
+        assert header_rows == list(range(header_rows[0], header_rows[-1] + 1))
+        assert header_rows[-1] < next(y for y in range(image.height) if pixels[image.width - 80, y] == DAY_COLORS[0])
+        previous_bottom = 0
+        for color in DAY_COLORS:
+            rows = [y for y in range(image.height) if pixels[image.width - 80, y] == color]
+            assert rows and rows[0] > previous_bottom
+            assert rows == list(range(rows[0], rows[-1] + 1))
+            previous_bottom = rows[-1]
+        assert parts[0].getbuffer().nbytes < group_pdf.MAX_PHOTO_BYTES
+
+
+def test_smaller_height_limit_scales_the_complete_week_instead_of_splitting_it(weekly_pdf):
+    location = next(item for item in extract_groups(weekly_pdf) if item.group == "MX-231.2.1")
+    parts = render_group(weekly_pdf, location, max_height=1000)
+    assert len(parts) == 1
+    with Image.open(parts[0]) as image:
+        assert image.height <= 1000
+        colors = {color for _, color in image.convert("RGB").getcolors(image.width * image.height)}
+        assert set(DAY_COLORS) <= colors
 
 
 def test_part_time_index_finds_later_blocks_and_limits_crop_to_one_group(part_time_pdf):

@@ -16,7 +16,10 @@ MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 40
 MAX_PAGE_CHARACTERS = 100_000
 TARGET_IMAGE_WIDTH = 1040
-MAX_IMAGE_HEIGHT = 1500
+MAX_IMAGE_HEIGHT = 8000
+MAX_PHOTO_DIMENSION_SUM = 10_000
+MAX_PHOTO_ASPECT_RATIO = 20
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
 _PDFIUM_LOCK = threading.RLock()
 _GROUP_PATTERN = re.compile(
     r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,8}[-\u2010-\u2015\u2212]\d{2,4}(?:\.\d{1,3}){0,3})(?![\d.])"
@@ -356,33 +359,25 @@ def render_group(
     pdf_bytes: bytes, location: GroupLocation, *,
     target_width: int = TARGET_IMAGE_WIDTH, max_height: int = MAX_IMAGE_HEIGHT,
 ) -> tuple[BytesIO, ...]:
-    """Render original pixels in day-aligned parts with a repeated group header."""
+    """Render the complete original group column as one image, with its header once."""
     _validate_bytes(pdf_bytes)
     if hashlib.sha256(pdf_bytes).hexdigest() != location.pdf_sha256:
         raise UnsupportedTimetableError("The group location belongs to a different PDF")
-    if not 600 <= target_width <= 1600 or not 800 <= max_height <= 2000:
+    if not 600 <= target_width <= 1600 or not 800 <= max_height <= MAX_IMAGE_HEIGHT:
         raise ValueError("Unsupported timetable image dimensions")
     if len(location.day_edges) < 2:
         raise UnsupportedTimetableError("The timetable has no safe day boundaries")
     padding = 16
     content_width = location.service_right - location.table_left + location.column_right - location.column_left + 3.6
+    content_height = location.table_top - location.table_bottom + 0.8
+    if content_width <= 0 or content_height <= 0:
+        raise UnsupportedTimetableError("The timetable crop has invalid dimensions")
     gap = 0 if abs(location.column_left - location.service_right) < 1.5 else 6
-    scale = min(8.0, (target_width - padding * 2 - gap) / content_width)
-    header_height = (location.table_top - location.day_edges[0] + 1.8) * scale
-    body_limit = (max_height - padding * 2 - header_height - 8) / scale - 1.8
-    parts: list[tuple[float, float]] = []
-    start = location.day_edges[0]
-    for index in range(1, len(location.day_edges)):
-        bottom = location.day_edges[index]
-        if start - bottom > body_limit:
-            previous = location.day_edges[index - 1]
-            if previous == start:
-                raise UnsupportedTimetableError("A single timetable day is too tall to render safely")
-            parts.append((previous, start))
-            start = previous
-    parts.append((location.day_edges[-1], start))
-    if len(parts) > 8:
-        raise UnsupportedTimetableError("The timetable requires too many image parts")
+    scale = min(
+        8.0,
+        (target_width - padding * 2 - gap) / content_width,
+        (max_height - padding * 2 - 2) / content_height,
+    )
 
     with _PDFIUM_LOCK:
         try:
@@ -392,31 +387,33 @@ def render_group(
                     raise UnsupportedTimetableError("The group page no longer exists")
                 page = document[location.page_index]
                 try:
-                    header = _render_band(page, location, location.day_edges[0], location.table_top, scale)
-                    rendered = []
+                    body = _render_band(page, location, location.table_bottom, location.table_top, scale)
                     try:
-                        for index, (bottom, top) in enumerate(parts):
-                            body = _render_band(page, location, bottom, top, scale)
-                            image = Image.new("RGB", (max(header.width, body.width) + padding * 2, header.height + body.height + padding * 2), "white")
-                            try:
-                                image.paste(header, (padding, padding))
-                                image.paste(body, (padding, padding + header.height))
-                                if image.height > max_height or image.width > target_width + 4:
-                                    raise UnsupportedTimetableError("The rendered timetable exceeds its image limits")
-                                output = BytesIO()
-                                image.save(output, format="PNG", optimize=True)
-                                output.name = f"group-{normalize_group(location.group)}-{index + 1}.png"
-                                output.seek(0)
-                                rendered.append(output)
-                            finally:
-                                image.close()
-                                body.close()
+                        width = max(body.width + padding * 2, (body.height + padding * 2 + MAX_PHOTO_ASPECT_RATIO - 1) // MAX_PHOTO_ASPECT_RATIO)
+                        height = max(body.height + padding * 2, (width + MAX_PHOTO_ASPECT_RATIO - 1) // MAX_PHOTO_ASPECT_RATIO)
+                        image = Image.new("RGB", (width, height), "white")
+                        try:
+                            image.paste(body, ((width - body.width) // 2, (height - body.height) // 2))
+                            if (
+                                image.height > max_height or image.width > target_width + 4
+                                or image.width + image.height > MAX_PHOTO_DIMENSION_SUM
+                                or max(image.size) > MAX_PHOTO_ASPECT_RATIO * min(image.size)
+                            ):
+                                raise UnsupportedTimetableError("The rendered timetable exceeds its image limits")
+                            output = BytesIO()
+                            image.save(output, format="PNG", optimize=True)
+                            if output.getbuffer().nbytes > MAX_PHOTO_BYTES:
+                                raise UnsupportedTimetableError("The rendered timetable image is too large")
+                            output.name = f"group-{normalize_group(location.group)}-week.png"
+                            output.seek(0)
+                        finally:
+                            image.close()
                     finally:
-                        header.close()
+                        body.close()
                 finally:
                     page.close()
             finally:
                 document.close()
         except pdfium.PdfiumError as exc:
             raise UnsupportedTimetableError("The timetable PDF could not be rendered") from exc
-    return tuple(rendered)
+    return (output,)
