@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -15,27 +17,43 @@ from .config import Settings
 
 DEFAULT_STATS_DB_PATH = ".data/user_stats.sqlite3"
 DEFAULT_STATS_KEY_PREFIX = "kabinet_navigator"
-ACTIVE_DAY_TTL_SECONDS = 90 * 24 * 60 * 60
-ACTIVE_NOW_WINDOW_SECONDS = 15 * 60
+ACTIVE_NOW_WINDOW_SECONDS = 5 * 60
+ACTIVE_24H_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Activity timestamps must be timezone-aware datetimes")
+    return value.astimezone(timezone.utc)
+
+
+def timestamp_text(value: datetime) -> str:
+    return value.isoformat(timespec="microseconds")
 
 
 @dataclass(frozen=True)
 class UserStats:
     total_users: int
-    active_today: int
     active_now: int
+    active_24h: int
     storage_name: str
     is_persistent: bool
+    observed_at: datetime
+    tracking_since: datetime | None
 
 
 class UserStatsStore(Protocol):
     storage_name: str
     is_persistent: bool
 
-    async def record_user(self, user_id: int, active_date: date) -> None:
+    async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
         ...
 
-    async def get_stats(self, active_date: date) -> UserStats:
+    async def get_stats(self, now: datetime | None = None) -> UserStats:
         ...
 
 
@@ -43,32 +61,38 @@ class MemoryUserStatsStore:
     storage_name = "memory"
     is_persistent = False
 
-    def __init__(self) -> None:
-        self._users: set[int] = set()
-        self._active_by_day: dict[str, set[int]] = {}
+    def __init__(self, *, clock: Callable[[], datetime] = utc_now) -> None:
+        self._clock = clock
         self._last_seen_by_user: dict[int, datetime] = {}
+        self._tracking_since: datetime | None = None
         self._lock = asyncio.Lock()
 
-    async def record_user(self, user_id: int, active_date: date) -> None:
-        day_key = active_date.isoformat()
-        async with self._lock:
-            self._users.add(user_id)
-            self._active_by_day.setdefault(day_key, set()).add(user_id)
-            self._last_seen_by_user[user_id] = datetime.now(timezone.utc)
+    def _touch_tracking_since(self, observed_at: datetime) -> None:
+        if self._tracking_since is None or observed_at < self._tracking_since:
+            self._tracking_since = observed_at
 
-    async def get_stats(self, active_date: date) -> UserStats:
-        day_key = active_date.isoformat()
-        active_since = datetime.now(timezone.utc) - timedelta(seconds=ACTIVE_NOW_WINDOW_SECONDS)
+    async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
         async with self._lock:
+            observed_at = as_utc(observed_at if observed_at is not None else self._clock())
+            previous = self._last_seen_by_user.get(user_id)
+            if previous is None or observed_at > previous:
+                self._last_seen_by_user[user_id] = observed_at
+            self._touch_tracking_since(observed_at)
+
+    async def get_stats(self, now: datetime | None = None) -> UserStats:
+        async with self._lock:
+            now = as_utc(now if now is not None else self._clock())
+            active_since = now - timedelta(seconds=ACTIVE_NOW_WINDOW_SECONDS)
+            day_since = now - timedelta(seconds=ACTIVE_24H_WINDOW_SECONDS)
+            self._touch_tracking_since(now)
             return UserStats(
-                total_users=len(self._users),
-                active_today=len(self._active_by_day.get(day_key, set())),
-                active_now=sum(
-                    1 for last_seen_at in self._last_seen_by_user.values()
-                    if last_seen_at >= active_since
-                ),
+                total_users=len(self._last_seen_by_user),
+                active_now=sum(active_since <= last_seen <= now for last_seen in self._last_seen_by_user.values()),
+                active_24h=sum(day_since <= last_seen <= now for last_seen in self._last_seen_by_user.values()),
                 storage_name=self.storage_name,
                 is_persistent=self.is_persistent,
+                observed_at=now,
+                tracking_since=self._tracking_since,
             )
 
 
@@ -76,148 +100,252 @@ class SQLiteUserStatsStore:
     storage_name = "sqlite"
     is_persistent = True
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, clock: Callable[[], datetime] = utc_now) -> None:
         self.db_path = Path(db_path)
+        self._clock = clock
 
-    async def record_user(self, user_id: int, active_date: date) -> None:
-        await asyncio.to_thread(self._record_user_sync, user_id, active_date)
+    async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
+        if observed_at is not None:
+            observed_at = as_utc(observed_at)
+        await asyncio.to_thread(self._record_user_sync, user_id, observed_at)
 
-    async def get_stats(self, active_date: date) -> UserStats:
-        return await asyncio.to_thread(self._get_stats_sync, active_date)
+    async def get_stats(self, now: datetime | None = None) -> UserStats:
+        if now is not None:
+            now = as_utc(now)
+        return await asyncio.to_thread(self._get_stats_sync, now)
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.db_path, timeout=5)
+        try:
+            # The schema migration, metadata, and counters share one transaction.
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_users (
+                    user_id INTEGER PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    last_active_date TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS bot_stats_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            version = connection.execute(
+                "SELECT value FROM bot_stats_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if version is None:
+                # Legacy rows used second precision. Normalize once so exact
+                # window boundaries compare correctly with new microsecond rows.
+                legacy_rows = connection.execute(
+                    "SELECT user_id, first_seen_at, last_seen_at FROM bot_users"
+                ).fetchall()
+                for user_id, first_seen, last_seen in legacy_rows:
+                    first_seen = as_utc(datetime.fromisoformat(first_seen))
+                    last_seen = as_utc(datetime.fromisoformat(last_seen))
+                    connection.execute(
+                        "UPDATE bot_users SET first_seen_at = ?, last_seen_at = ? WHERE user_id = ?",
+                        (timestamp_text(first_seen), timestamp_text(last_seen), user_id),
+                    )
+                earliest = connection.execute("SELECT MIN(first_seen_at) FROM bot_users").fetchone()[0]
+                if earliest is not None:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO bot_stats_metadata (key, value) VALUES ('tracking_since', ?)",
+                        (earliest,),
+                    )
+                connection.execute(
+                    "INSERT INTO bot_stats_metadata (key, value) VALUES ('schema_version', '2')"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS bot_users_last_seen_idx ON bot_users (last_seen_at)"
+            )
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    def _touch_tracking_since(self, connection: sqlite3.Connection, observed_at: datetime) -> None:
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS bot_users (
-                user_id INTEGER PRIMARY KEY,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                last_active_date TEXT NOT NULL
-            )
-            """
+            INSERT INTO bot_stats_metadata (key, value) VALUES ('tracking_since', ?)
+            ON CONFLICT(key) DO UPDATE SET value = MIN(value, excluded.value)
+            """,
+            (timestamp_text(observed_at),),
         )
-        return connection
 
-    def _record_user_sync(self, user_id: int, active_date: date) -> None:
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        day_key = active_date.isoformat()
-        with self._connect() as connection:
+    def _record_user_sync(self, user_id: int, observed_at: datetime | None) -> None:
+        with closing(self._connect()) as connection, connection:
+            observed_at = as_utc(observed_at if observed_at is not None else self._clock())
+            observed_text = timestamp_text(observed_at)
+            self._touch_tracking_since(connection, observed_at)
             connection.execute(
                 """
                 INSERT INTO bot_users (user_id, first_seen_at, last_seen_at, last_active_date)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    last_seen_at = excluded.last_seen_at,
-                    last_active_date = excluded.last_active_date
+                    first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                    last_seen_at = MAX(last_seen_at, excluded.last_seen_at),
+                    last_active_date = CASE
+                        WHEN excluded.last_seen_at > last_seen_at THEN excluded.last_active_date
+                        ELSE last_active_date
+                    END
                 """,
-                (user_id, now, now, day_key),
+                (user_id, observed_text, observed_text, observed_at.date().isoformat()),
             )
 
-    def _get_stats_sync(self, active_date: date) -> UserStats:
-        day_key = active_date.isoformat()
-        active_since = (
-            datetime.now(timezone.utc) - timedelta(seconds=ACTIVE_NOW_WINDOW_SECONDS)
-        ).isoformat(timespec="seconds")
-        with self._connect() as connection:
-            total_users = connection.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
-            active_today = connection.execute(
-                "SELECT COUNT(*) FROM bot_users WHERE last_active_date = ?",
-                (day_key,),
-            ).fetchone()[0]
-            active_now = connection.execute(
-                "SELECT COUNT(*) FROM bot_users WHERE last_seen_at >= ?",
-                (active_since,),
+    def _get_stats_sync(self, now: datetime | None) -> UserStats:
+        with closing(self._connect()) as connection, connection:
+            now = as_utc(now if now is not None else self._clock())
+            active_since = now - timedelta(seconds=ACTIVE_NOW_WINDOW_SECONDS)
+            day_since = now - timedelta(seconds=ACTIVE_24H_WINDOW_SECONDS)
+            now_text = timestamp_text(now)
+            self._touch_tracking_since(connection, now)
+            total_users, active_now, active_24h = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM bot_users),
+                    (SELECT COUNT(*) FROM bot_users WHERE last_seen_at BETWEEN ? AND ?),
+                    (SELECT COUNT(*) FROM bot_users WHERE last_seen_at BETWEEN ? AND ?)
+                """,
+                (timestamp_text(active_since), now_text, timestamp_text(day_since), now_text),
+            ).fetchone()
+            tracking_since = connection.execute(
+                "SELECT value FROM bot_stats_metadata WHERE key = 'tracking_since'"
             ).fetchone()[0]
         return UserStats(
             total_users=total_users,
-            active_today=active_today,
             active_now=active_now,
+            active_24h=active_24h,
             storage_name=self.storage_name,
             is_persistent=self.is_persistent,
+            observed_at=now,
+            tracking_since=as_utc(datetime.fromisoformat(tracking_since)),
         )
+
+
+RECORD_ACTIVITY_SCRIPT = """
+local timestamp = ARGV[2]
+if timestamp == '' then
+    local clock = redis.call('TIME')
+    timestamp = string.format('%.6f', tonumber(clock[1]) + tonumber(clock[2]) / 1000000)
+end
+local since = redis.call('GET', KEYS[3])
+if not since or tonumber(timestamp) < tonumber(since) then
+    redis.call('SET', KEYS[3], timestamp)
+end
+redis.call('SADD', KEYS[1], ARGV[1])
+redis.call('ZADD', KEYS[2], 'GT', timestamp, ARGV[1])
+return 1
+"""
+
+READ_ACTIVITY_SCRIPT = """
+local timestamp = ARGV[1]
+if timestamp == '' then
+    local clock = redis.call('TIME')
+    timestamp = string.format('%.6f', tonumber(clock[1]) + tonumber(clock[2]) / 1000000)
+end
+local since = redis.call('GET', KEYS[3])
+if not since or tonumber(timestamp) < tonumber(since) then
+    redis.call('SET', KEYS[3], timestamp)
+    since = timestamp
+end
+local active_since = string.format('%.6f', tonumber(timestamp) - tonumber(ARGV[2]))
+local day_since = string.format('%.6f', tonumber(timestamp) - tonumber(ARGV[3]))
+return {
+    redis.call('SCARD', KEYS[1]),
+    redis.call('ZCOUNT', KEYS[2], active_since, timestamp),
+    redis.call('ZCOUNT', KEYS[2], day_since, timestamp),
+    since,
+    timestamp
+}
+"""
 
 
 class UpstashRedisUserStatsStore:
     storage_name = "upstash_redis"
     is_persistent = True
 
-    def __init__(self, rest_url: str, rest_token: str, key_prefix: str) -> None:
+    def __init__(
+        self, rest_url: str, rest_token: str, key_prefix: str, *, clock: Callable[[], datetime] | None = None
+    ) -> None:
         self.rest_url = rest_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {rest_token}"}
         self.key_prefix = key_prefix.strip() or DEFAULT_STATS_KEY_PREFIX
+        self._clock = clock
 
-    async def record_user(self, user_id: int, active_date: date) -> None:
-        day_key = active_date.isoformat()
-        active_key = self._active_key(day_key)
-        active_now_key = self._active_now_key()
-        now_timestamp = int(datetime.now(timezone.utc).timestamp())
-        commands = [
-            ["SADD", self._users_key(), str(user_id)],
-            ["SADD", active_key, str(user_id)],
-            ["EXPIRE", active_key, ACTIVE_DAY_TTL_SECONDS],
-            ["ZADD", active_now_key, now_timestamp, str(user_id)],
-            ["EXPIRE", active_now_key, ACTIVE_NOW_WINDOW_SECONDS * 2],
+    def _keys(self) -> list[str]:
+        # Keep the existing all-time users set. The new last_seen index has no
+        # TTL; the legacy active_now index expired and cannot recover 24 hours.
+        return [
+            f"{self.key_prefix}:users",
+            f"{self.key_prefix}:last_seen",
+            f"{self.key_prefix}:activity_tracking_since",
         ]
-        await asyncio.to_thread(self._run_pipeline, commands)
 
-    async def get_stats(self, active_date: date) -> UserStats:
-        day_key = active_date.isoformat()
-        active_now_key = self._active_now_key()
-        active_before = int(
-            (
-                datetime.now(timezone.utc) - timedelta(seconds=ACTIVE_NOW_WINDOW_SECONDS)
-            ).timestamp()
-        )
+    async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
+        if observed_at is None and self._clock is not None:
+            observed_at = self._clock()
+        timestamp = f"{as_utc(observed_at).timestamp():.6f}" if observed_at is not None else ""
         result = await asyncio.to_thread(
-            self._run_pipeline,
+            self._run_script, RECORD_ACTIVITY_SCRIPT, [str(user_id), timestamp]
+        )
+        if type(result) is not int or result != 1:
+            raise RuntimeError("Unexpected Upstash Redis record result")
+
+    async def get_stats(self, now: datetime | None = None) -> UserStats:
+        if now is None and self._clock is not None:
+            now = self._clock()
+        timestamp = f"{as_utc(now).timestamp():.6f}" if now is not None else ""
+        result = await asyncio.to_thread(
+            self._run_script,
+            READ_ACTIVITY_SCRIPT,
             [
-                ["SCARD", self._users_key()],
-                ["SCARD", self._active_key(day_key)],
-                ["ZREMRANGEBYSCORE", active_now_key, "-inf", active_before],
-                ["ZCARD", active_now_key],
+                timestamp,
+                str(ACTIVE_NOW_WINDOW_SECONDS),
+                str(ACTIVE_24H_WINDOW_SECONDS),
             ],
         )
+        if not isinstance(result, list) or len(result) != 5:
+            raise RuntimeError("Unexpected Upstash Redis activity response format")
+        try:
+            if any(type(item) is not int for item in result[:3]):
+                raise ValueError("Activity counters must be integers")
+            counts = result[:3]
+            if any(item < 0 for item in counts) or not counts[0] >= counts[2] >= counts[1]:
+                raise ValueError("Inconsistent activity counters")
+            tracking_since = datetime.fromtimestamp(float(result[3]), timezone.utc)
+            observed_at = datetime.fromtimestamp(float(result[4]), timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise RuntimeError("Invalid Upstash Redis activity response") from exc
         return UserStats(
-            total_users=int(result[0]),
-            active_today=int(result[1]),
-            active_now=int(result[3]),
+            total_users=counts[0],
+            active_now=counts[1],
+            active_24h=counts[2],
             storage_name=self.storage_name,
             is_persistent=self.is_persistent,
+            observed_at=observed_at,
+            tracking_since=tracking_since,
         )
 
-    def _users_key(self) -> str:
-        return f"{self.key_prefix}:users"
-
-    def _active_key(self, day_key: str) -> str:
-        return f"{self.key_prefix}:active:{day_key}"
-
-    def _active_now_key(self) -> str:
-        return f"{self.key_prefix}:active_now"
-
-    def _run_pipeline(self, commands: list[list[object]]) -> list[object]:
+    def _run_script(self, script: str, args: list[str]) -> object:
+        keys = self._keys()
         response = requests.post(
-            f"{self.rest_url}/pipeline",
+            self.rest_url,
             headers=self.headers,
-            json=commands,
+            json=["EVAL", script, len(keys), *keys, *args],
             timeout=5,
         )
         response.raise_for_status()
         payload = response.json()
-        if isinstance(payload, dict) and payload.get("error"):
-            raise RuntimeError(payload["error"])
-        if not isinstance(payload, list):
+        if not isinstance(payload, dict):
             raise RuntimeError("Unexpected Upstash Redis response format")
-
-        results: list[object] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                raise RuntimeError("Unexpected Upstash Redis pipeline item format")
-            if item.get("error"):
-                raise RuntimeError(item["error"])
-            results.append(item.get("result"))
-        return results
+        if payload.get("error"):
+            raise RuntimeError("Upstash Redis rejected the activity request")
+        if "result" not in payload:
+            raise RuntimeError("Missing Upstash Redis activity result")
+        return payload["result"]
 
 
 def build_user_stats_store(settings: Settings) -> UserStatsStore:

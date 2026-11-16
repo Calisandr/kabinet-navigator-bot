@@ -54,6 +54,15 @@ def load_settings() -> Settings:
     except ValueError:
         cache_minutes = 15
 
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    if not (redis_url and redis_token):
+        # Vercel Marketplace creates this pair when connecting Upstash Redis.
+        marketplace_url = os.getenv("KV_REST_API_URL", "").strip()
+        marketplace_token = os.getenv("KV_REST_API_TOKEN", "").strip()
+        if marketplace_url and marketplace_token:
+            redis_url, redis_token = marketplace_url, marketplace_token
+
     return Settings(
         telegram_bot_token=token,
         google_sheet_id=os.getenv("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID).strip()
@@ -65,8 +74,8 @@ def load_settings() -> Settings:
         webhook_url=os.getenv("WEBHOOK_URL", "").strip(),
         admin_user_ids=parse_admin_user_ids(os.getenv("ADMIN_USER_IDS", "")),
         user_stats_db_path=os.getenv("USER_STATS_DB_PATH", ".data/user_stats.sqlite3").strip(),
-        upstash_redis_rest_url=os.getenv("UPSTASH_REDIS_REST_URL", "").strip(),
-        upstash_redis_rest_token=os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip(),
+        upstash_redis_rest_url=redis_url,
+        upstash_redis_rest_token=redis_token,
         user_stats_key_prefix=os.getenv("USER_STATS_KEY_PREFIX", "kabinet_navigator").strip()
         or "kabinet_navigator",
     )
