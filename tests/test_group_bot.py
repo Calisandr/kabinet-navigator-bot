@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from datetime import date
 from io import BytesIO
@@ -29,7 +30,7 @@ def option(group="ИСт-241.2", category="vo", start=START, end=END):
     )
 
 
-def timetable(*, group="ИСт-241.2", category="vo", start=START, end=END, images=2):
+def timetable(*, group="ИСт-241.2", category="vo", start=START, end=END, images=1):
     source = GroupScheduleSource(
         title="Официальное расписание",
         category=category,
@@ -96,7 +97,7 @@ def test_group_prompt_shows_example_and_three_categories_without_loading_pdfs(mo
     service.get_timetable.assert_not_called()
 
 
-def test_group_command_gives_feedback_before_work_and_sends_images_with_official_links(monkeypatch):
+def test_group_command_gives_feedback_before_work_and_sends_one_week_image_with_official_links(monkeypatch):
     update, context, service = environment(monkeypatch, args=["ИСт-241.2"])
     events = []
     ui_thread = threading.get_ident()
@@ -116,17 +117,18 @@ def test_group_command_gives_feedback_before_work_and_sends_images_with_official
     assert events[0] == ("feedback", "Подготавливаю расписание...")
     assert events[1][0] == "service" and events[1][1] != ui_thread
     service.get_timetable.assert_called_once_with("ИСт-241.2", TODAY, category=None, period_start=None)
-    assert update.effective_message.reply_photo.await_count == 2
-    for index, call in enumerate(update.effective_message.reply_photo.await_args_list, start=1):
-        caption = call.kwargs["caption"]
-        assert "ИСт-241.2" in caption
-        assert "16.11.2026 — 21.11.2026" in caption
-        assert "ВО и лицей" in caption
-        assert "Оригинальное расписание (PDF)" in caption
-        assert 'href="https://www.prk.kuzstu.ru/upload/schedule.pdf?a=1&amp;b=2"' in caption
-        assert "Полный официальный документ филиала; из него взят фрагмент вашей группы." in caption
-        assert f"Фрагмент {index} из 2" in caption
-        assert call.kwargs["photo"].tell() == 0
+    update.effective_message.reply_photo.assert_awaited_once()
+    call = update.effective_message.reply_photo.await_args
+    caption = call.kwargs["caption"]
+    assert "ИСт-241.2" in caption
+    assert "16.11.2026 — 21.11.2026" in caption
+    assert "ВО и лицей" in caption
+    assert "Оригинальное расписание (PDF)" in caption
+    assert 'href="https://www.prk.kuzstu.ru/upload/schedule.pdf?a=1&amp;b=2"' in caption
+    assert "Полный официальный документ филиала; из него взят фрагмент вашей группы." in caption
+    assert not re.search(r"Фрагмент\s+\d+\s+из\s+\d+", caption)
+    assert call.kwargs["photo"].tell() == 0
+    assert call.kwargs["reply_markup"] is not None
 
 
 def test_typed_group_uses_the_same_service_and_shows_actual_past_period(monkeypatch):
@@ -136,6 +138,7 @@ def test_typed_group_uses_the_same_service_and_shows_actual_past_period(monkeypa
     asyncio.run(group_bot.on_group_text(update, context))
 
     service.get_timetable.assert_called_once_with("ИСт-241.2", TODAY, category=None, period_start=None)
+    update.effective_message.reply_photo.assert_awaited_once()
     caption = update.effective_message.reply_photo.await_args.kwargs["caption"]
     assert "02.11.2026 — 07.11.2026" in caption
     assert "Последнее опубликованное расписание (период уже завершён)" in caption
@@ -203,6 +206,7 @@ def test_group_callback_contains_category_group_and_period_without_user_state(mo
     assert asyncio.run(group_bot.handle_group_callback(update, context, "gg:vo:20261116:ИСт-241.2")) is True
 
     service.get_timetable.assert_called_once_with("ИСт-241.2", TODAY, category="vo", period_start=START)
+    update.effective_message.reply_photo.assert_awaited_once()
     update.callback_query.answer.assert_not_awaited()
 
 
@@ -217,7 +221,7 @@ def test_multi_suffix_group_is_supported_in_plain_text_and_callback(monkeypatch)
     clicked, fresh_context, fresh_service = environment(monkeypatch, result=timetable(group=group))
     asyncio.run(group_bot.handle_group_callback(clicked, fresh_context, f"gg:vo:20261116:{group}"))
     fresh_service.get_timetable.assert_called_once_with(group, TODAY, category="vo", period_start=START)
-    clicked.effective_message.reply_photo.assert_awaited()
+    clicked.effective_message.reply_photo.assert_awaited_once()
 
 
 def test_groups_command_accepts_category_alias(monkeypatch):
@@ -311,14 +315,24 @@ def test_timeout_returns_a_clear_response_instead_of_silence(monkeypatch):
     update.effective_message.reply_photo.assert_not_awaited()
 
 
-def test_empty_images_and_empty_group_lists_have_explicit_responses(monkeypatch):
-    update, context, _ = environment(monkeypatch, args=["ИСт-241.2"], result=timetable(images=0))
-    asyncio.run(group_bot.group_command(update, context))
-    assert "не удалось подготовить изображение" in update.effective_message.reply_text.await_args.args[0]
-
+def test_empty_group_list_has_an_explicit_response(monkeypatch):
     empty_update, empty_context, _ = environment(monkeypatch, options=())
     asyncio.run(group_bot.handle_group_callback(empty_update, empty_context, "gl:vo:0"))
     assert "группы не найдены" in empty_update.effective_message.reply_text.await_args.args[0]
+
+
+@pytest.mark.parametrize("image_count", [0, 2, 3])
+def test_non_single_image_result_returns_the_original_instead_of_sending_partial_week(monkeypatch, image_count):
+    update, context, _ = environment(monkeypatch, args=["ИСт-241.2"], result=timetable(images=image_count))
+
+    asyncio.run(group_bot.group_command(update, context))
+
+    text = update.effective_message.reply_text.await_args.args[0]
+    assert "Не удалось подготовить единое изображение" in text
+    assert "весь период" in text
+    assert "Оригинальное расписание (PDF)" in text
+    assert 'href="https://www.prk.kuzstu.ru/upload/schedule.pdf?a=1&amp;b=2"' in text
+    update.effective_message.reply_photo.assert_not_awaited()
 
 
 def test_photo_send_failure_still_returns_the_official_pdf(monkeypatch):

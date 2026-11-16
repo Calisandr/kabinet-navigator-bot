@@ -5,12 +5,21 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from app import group_schedule as module
 from app.group_sources import GroupScheduleSource, GroupSourceError
 
 
 TODAY = date(2026, 11, 16)
+
+
+def png(color="white", size=(100, 120)):
+    result = BytesIO()
+    with Image.new("RGB", size, color) as image:
+        image.save(result, "PNG")
+    result.seek(0)
+    return result
 
 
 def source(name="current", *, category="spo", start=TODAY, end=date(2026, 11, 22)):
@@ -79,7 +88,7 @@ def test_exact_group_match_renders_original_and_preserves_source(monkeypatch):
     selected = location("МАб-241.2.1")
     other = location("МАб-241.2.2", column=200)
     monkeypatch.setattr(module, "extract_groups", lambda _: (selected, other))
-    images = (BytesIO(b"image-1"), BytesIO(b"image-2"))
+    images = (png(),)
     calls = []
     monkeypatch.setattr(module, "render_group", lambda data, item: calls.append((data, item)) or images)
 
@@ -111,19 +120,23 @@ def test_duplicate_group_in_different_categories_requires_an_explicit_selection(
     assert {item.category for item in error.value.suggestions} == {"vo", "spo"}
 
 
-def test_group_continuing_on_another_page_returns_all_its_fragments(monkeypatch):
+def test_group_continuing_on_another_page_returns_one_image_in_page_order(monkeypatch):
     current = source()
     repo = Repository([current], {current.url: b"current"})
     first = location("ИСт-241.2", page=0)
     second = location("ИСт-241.2", page=1)
     monkeypatch.setattr(module, "extract_groups", lambda _: [first, second])
     calls = []
-    monkeypatch.setattr(module, "render_group", lambda _, item: calls.append(item) or (BytesIO(str(item.page_index).encode()),))
+    monkeypatch.setattr(module, "render_group", lambda _, item: calls.append(item) or (png("red" if item.page_index == 0 else "blue"),))
 
     result = module.GroupScheduleService(repo).get_timetable("ИСт-241.2", TODAY)
 
     assert calls == [first, second]
-    assert [image.getvalue() for image in result.images] == [b"0", b"1"]
+    assert len(result.images) == 1
+    with Image.open(result.images[0]) as image:
+        assert image.size == (100, 240)
+        assert image.getpixel((50, 60)) == (255, 0, 0)
+        assert image.getpixel((50, 180)) == (0, 0, 255)
 
 
 def test_changed_pdf_at_the_same_url_is_reindexed_before_cropping(monkeypatch):
@@ -133,7 +146,7 @@ def test_changed_pdf_at_the_same_url_is_reindexed_before_cropping(monkeypatch):
     replacement = location("ИСт-241.2", column=300)
     monkeypatch.setattr(module, "extract_groups", lambda data: [original if data == b"first" else replacement])
     calls = []
-    monkeypatch.setattr(module, "render_group", lambda data, item: calls.append((data, item)) or (BytesIO(b"img"),))
+    monkeypatch.setattr(module, "render_group", lambda data, item: calls.append((data, item)) or (png(),))
 
     module.GroupScheduleService(repo).get_timetable("ИСт-241.2", TODAY)
 
@@ -177,7 +190,7 @@ def test_available_group_still_works_if_an_unrelated_category_is_temporarily_dow
     spo = source("spo", category="spo")
     repo = Repository([vo, spo], {vo.url: b"vo", spo.url: GroupSourceError("connection failed")})
     monkeypatch.setattr(module, "extract_groups", lambda _: [location("ГПс-231.2")])
-    monkeypatch.setattr(module, "render_group", lambda *_: (BytesIO(b"image"),))
+    monkeypatch.setattr(module, "render_group", lambda *_: (png(),))
 
     result = module.GroupScheduleService(repo).get_timetable("ГПс-231.2", TODAY)
 
@@ -203,3 +216,25 @@ def test_index_cache_is_bounded_and_changes_when_file_content_changes(monkeypatc
         service._locations(current, content)
     assert calls == [b"one", b"two", b"three"]
     assert len(service._indexes) == 2
+
+
+def test_continuations_are_scaled_together_to_fit_telegram_limits():
+    result = module._single_week_image((png("red", (1000, 4600)), png("blue", (1000, 4600))), "ИСт-241.2")
+    with Image.open(result) as image:
+        assert image.height <= 8000
+        assert image.width + image.height < 10000
+        assert max(image.size) / min(image.size) <= 20
+        assert image.getpixel((image.width // 2, image.height // 4)) == (255, 0, 0)
+        assert image.getpixel((image.width // 2, image.height * 3 // 4)) == (0, 0, 255)
+
+
+def test_unreadable_rendered_image_returns_source_link_instead_of_partial_result(monkeypatch):
+    current = source()
+    repo = Repository([current], {current.url: b"current"})
+    monkeypatch.setattr(module, "extract_groups", lambda _: [location("ИСт-241.2")])
+    monkeypatch.setattr(module, "render_group", lambda *_: (BytesIO(b"invalid image"),))
+
+    with pytest.raises(module.GroupScheduleError) as error:
+        module.GroupScheduleService(repo).get_timetable("ИСт-241.2", TODAY)
+
+    assert error.value.source_url == current.url
