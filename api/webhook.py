@@ -81,9 +81,21 @@ def get_settings() -> Settings:
 async def get_application() -> Application:
     global _application
     if _application is None:
-        _application = build_application(get_settings())
-        await _application.initialize()
-        await set_bot_commands(_application)
+        application = build_application(get_settings())
+        try:
+            await application.initialize()
+            await set_bot_commands(application)
+        except BaseException:
+            try:
+                try:
+                    await application.shutdown()
+                finally:
+                    # Application.shutdown() skips a partially initialized bot.
+                    await application.bot.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to clean up application after startup failure")
+            raise
+        _application = application
     return _application
 
 
