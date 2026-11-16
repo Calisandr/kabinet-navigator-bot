@@ -37,6 +37,15 @@ from .formatting import (
     format_teachers_list,
     split_long_message,
 )
+from .group_bot import (
+    group_command,
+    groups_command,
+    handle_group_callback,
+    looks_like_group,
+    on_group_text,
+    send_group_prompt,
+)
+from .group_schedule import GroupScheduleService
 from .schedule import GoogleSheetScheduleRepository, Schedule
 from .schedule_image import render_day_schedule_image
 from .stats import UserStatsStore, build_user_stats_store
@@ -54,13 +63,14 @@ STATS_READ_TIMEOUT_SECONDS = 3.0
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
+        ["Расписание группы"],
         ["Вчера", "Сегодня", "Завтра"],
         ["Ближайшие даты", "Найти преподавателя"],
         ["Все преподаватели", "Обновить"],
         ["Статистика"],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Введите фамилию или дату",
+    input_field_placeholder="Группа, фамилия или дата",
 )
 
 
@@ -128,10 +138,14 @@ async def track_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>Кабинетный Навигатор</b>\n\n"
-        "Я показываю, кто из преподавателей в каком компьютерном кабинете находится "
-        "по данным Google Таблицы.\n\n"
-        "Можно нажать кнопку или просто отправить фамилию: <code>Григорьев</code>.\n"
-        "Для даты подходит формат: <code>02.05.2026</code>, а еще слова "
+        "Показываю расписание учебных групп Прокопьевского филиала КузГТУ "
+        "из официальных документов сайта. Нажми <b>«Расписание группы»</b> "
+        "или отправь код: <code>ИСт-241.2</code>.\n"
+        "Пришлю читаемый фрагмент с предметами и ссылкой на оригинальный PDF.\n\n"
+        "Также можно найти преподавателя по фамилии: <code>Григорьев</code>. "
+        "Кнопки «Сегодня», «Завтра» и даты показывают занятость компьютерных кабинетов "
+        "по данным Google Таблицы.\n"
+        "Для даты подходит формат: <code>02.05.2026</code>, а также слова "
         "<code>вчера</code>, <code>сегодня</code>, <code>завтра</code>."
     )
     await update.effective_message.reply_text(
@@ -144,6 +158,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>Команды</b>\n\n"
+        "<b>Расписание учебных групп</b>\n"
+        "/group ИСт-241.2 - предметы и пары выбранной группы\n"
+        "/groups - список групп по разделам\n\n"
+        "<b>Компьютерные кабинеты</b>\n"
         "/today - расписание на сегодня\n"
         "/tomorrow - расписание на завтра\n"
         "/next - ближайшие даты из таблицы\n"
@@ -303,11 +321,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if lowered == "статистика":
         await stats_command(update, context)
         return
+    if lowered in {"расписание группы", "расписание групп", "моя группа"}:
+        context.user_data.pop("awaiting_teacher", None)
+        await send_group_prompt(update, context)
+        return
 
     parsed_date = parse_user_date(text, today_for(context))
     if parsed_date:
         context.user_data.pop("awaiting_teacher", None)
         await send_date_schedule(update, context, parsed_date)
+        return
+
+    if looks_like_group(text):
+        context.user_data.pop("awaiting_teacher", None)
+        await on_group_text(update, context)
         return
 
     context.user_data.pop("awaiting_teacher", None)
@@ -321,6 +348,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
     data = query.data or ""
+    if await handle_group_callback(update, context, data):
+        return
     if data.startswith("date:"):
         try:
             target = date.fromisoformat(data.removeprefix("date:"))
@@ -456,10 +485,13 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
     application.bot_data["schedule_cache"] = cache
     application.bot_data["user_stats_store"] = build_user_stats_store(settings)
+    application.bot_data["group_schedule_service"] = GroupScheduleService()
 
     application.add_handler(TypeHandler(Update, track_usage), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("group", group_command))
+    application.add_handler(CommandHandler("groups", groups_command))
     application.add_handler(CommandHandler("yesterday", yesterday_command))
     application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("tomorrow", tomorrow_command))
