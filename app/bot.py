@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
@@ -46,7 +46,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+# HTTPX request URLs include the Telegram bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
+STATS_RECORD_TIMEOUT_SECONDS = 2.0
+STATS_READ_TIMEOUT_SECONDS = 3.0
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -94,24 +98,31 @@ def get_user_stats_store(context: ContextTypes.DEFAULT_TYPE) -> UserStatsStore:
     return context.application.bot_data["user_stats_store"]
 
 
-def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
-    timezone_name = get_settings(context).timezone
+def timezone_for(timezone_name: str) -> tzinfo:
     try:
-        timezone = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        timezone = ZoneInfo("UTC")
-    return datetime.now(timezone).date()
+        return ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
+
+
+def today_for(context: ContextTypes.DEFAULT_TYPE) -> date:
+    return datetime.now(timezone_for(get_settings(context).timezone)).date()
 
 
 async def track_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if user is None:
+    if user is None or user.is_bot:
+        return
+    if update.message is None and update.callback_query is None:
         return
 
     try:
-        await get_user_stats_store(context).record_user(user.id, today_for(context))
-    except Exception:
-        LOGGER.exception("Failed to record user stats")
+        await asyncio.wait_for(
+            get_user_stats_store(context).record_user(user.id),
+            timeout=STATS_RECORD_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        LOGGER.warning("User activity could not be recorded (%s)", type(exc).__name__)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,12 +230,44 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    stats = await get_user_stats_store(context).get_stats(today_for(context))
+    try:
+        stats = await asyncio.wait_for(
+            get_user_stats_store(context).get_stats(),
+            timeout=STATS_READ_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        LOGGER.warning("User statistics are unavailable (%s)", type(exc).__name__)
+        await update.effective_message.reply_text(
+            "Статистика временно недоступна. Попробуйте чуть позже.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    def count(value: int) -> str:
+        return f"{value:,}".replace(",", " ")
+
+    local_timezone = timezone_for(settings.timezone)
+    observed_at = stats.observed_at.astimezone(local_timezone)
     text = (
-        "<b>Статистика бота</b>\n\n"
-        f"Пользователей: <b>{stats.total_users}</b>\n"
-        f"Активны за последние 15 минут: <b>{stats.active_now}</b>"
+        "📊 <b>Статистика бота</b>\n\n"
+        f"Сейчас (за 5 минут): <b>{count(stats.active_now)}</b>\n"
+        f"За последние 24 часа: <b>{count(stats.active_24h)}</b>\n"
+        f"Всего пользователей: <b>{count(stats.total_users)}</b>\n\n"
+        "Каждый человек учитывается один раз в каждом показателе.\n"
+        "«Сейчас» означает недавнее обращение к боту.\n\n"
+        f"Данные на: <i>{observed_at:%d.%m.%Y %H:%M %Z}</i>"
     )
+    if stats.tracking_since is not None:
+        tracking_since = stats.tracking_since.astimezone(local_timezone)
+        text += f"\nУчёт активности с: <i>{tracking_since:%d.%m.%Y %H:%M %Z}</i>"
+        if stats.observed_at - stats.tracking_since < timedelta(hours=24):
+            text += "\n<i>Данные за полные 24 часа ещё накапливаются.</i>"
+    if not stats.is_persistent:
+        text += (
+            "\n\n⚠️ <b>Временная статистика</b>\n"
+            "Данные хранятся в памяти одного процесса и сбрасываются при перезапуске. "
+            "Общее число пользователей может быть неполным."
+        )
     await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
