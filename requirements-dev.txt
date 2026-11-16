@@ -1,0 +1,4 @@
+# Development-only checks; runtime packages remain in the hashed requirements.txt.
+pytest==9.2.0
+bandit==1.9.4
+pip-audit==2.10.1

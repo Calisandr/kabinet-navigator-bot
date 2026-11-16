@@ -1,16 +1,41 @@
 from __future__ import annotations
 
 import re
+import time
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
 from typing import Iterable
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
+
+from .document_safety import (
+    MAX_TOTAL_WORKSHEET_ROWS, MAX_WORKSHEETS, MAX_XLSX_BYTES,
+    UnsafeDocumentError, validate_sheet_dimensions, validate_xlsx,
+)
+
+
+_SHEET_ID = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
+
+
+def _google_export_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if (
+            parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
+            or parsed.port not in (None, 443)
+            or not (hostname == "docs.google.com" or hostname.endswith(".googleusercontent.com"))
+        ):
+            raise ValueError("Untrusted export destination")
+        return url
+    except (TypeError, ValueError) as exc:
+        raise UnsafeDocumentError("The spreadsheet export redirect is not an official Google address") from exc
 
 
 MONTHS = {
@@ -96,6 +121,10 @@ class Schedule:
 
 class GoogleSheetScheduleRepository:
     def __init__(self, spreadsheet_id: str, timeout: int = 30) -> None:
+        if not isinstance(spreadsheet_id, str) or not _SHEET_ID.fullmatch(spreadsheet_id):
+            raise ValueError("GOOGLE_SHEET_ID must be a spreadsheet ID, not a URL or path")
+        if not 0 < timeout <= 60:
+            raise ValueError("Unsupported spreadsheet download timeout")
         self.spreadsheet_id = spreadsheet_id
         self.timeout = timeout
 
@@ -106,14 +135,47 @@ class GoogleSheetScheduleRepository:
             f"{self.spreadsheet_id}/export?format=xlsx"
         )
 
+    def _download(self) -> bytes:
+        url = _google_export_url(self.xlsx_url)
+        deadline = time.monotonic() + self.timeout
+        try:
+            for _ in range(5):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UnsafeDocumentError("The spreadsheet export exceeded its download deadline")
+                with requests.get(
+                    url, timeout=(min(5.0, remaining), min(10.0, remaining)),
+                    stream=True, allow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        destination = response.headers.get("Location")
+                        if not destination:
+                            raise UnsafeDocumentError("The spreadsheet export redirect has no destination")
+                        url = _google_export_url(urljoin(url, destination))
+                        continue
+                    response.raise_for_status()
+                    _google_export_url(response.url or url)
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if "html" in content_type:
+                        raise UnsafeDocumentError("Google returned HTML instead of XLSX; check the table sharing settings")
+                    length = response.headers.get("Content-Length", "")
+                    if length.isdigit() and int(length) > MAX_XLSX_BYTES:
+                        raise UnsafeDocumentError("The spreadsheet export exceeds the download limit")
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if time.monotonic() > deadline:
+                            raise UnsafeDocumentError("The spreadsheet export exceeded its download deadline")
+                        if len(data) + len(chunk) > MAX_XLSX_BYTES:
+                            raise UnsafeDocumentError("The spreadsheet export exceeds the download limit")
+                        data.extend(chunk)
+                    return bytes(data)
+            raise UnsafeDocumentError("Too many redirects from the spreadsheet export server")
+        except requests.RequestException as exc:
+            raise UnsafeDocumentError("The official spreadsheet export is temporarily unavailable") from exc
+
     def load(self) -> Schedule:
-        response = requests.get(self.xlsx_url, timeout=self.timeout)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if "html" in content_type.lower():
-            raise RuntimeError(
-                "Google returned HTML instead of XLSX. Check sharing access for the table."
-            )
+        content = self._download()
+        validate_xlsx(content)
 
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -121,14 +183,25 @@ class GoogleSheetScheduleRepository:
                 message="DrawingML support is incomplete.*",
                 category=UserWarning,
             )
-            workbook = load_workbook(BytesIO(response.content), data_only=True, read_only=False)
-        entries = parse_workbook(workbook)
+            workbook = load_workbook(BytesIO(content), data_only=True, read_only=False, keep_links=False)
+        try:
+            entries = parse_workbook(workbook)
+        finally:
+            workbook.close()
         return Schedule(entries=tuple(entries), loaded_at=datetime.now())
 
 
 def parse_workbook(workbook) -> list[ScheduleEntry]:
     entries: list[ScheduleEntry] = []
+    if len(workbook.worksheets) > MAX_WORKSHEETS:
+        raise UnsafeDocumentError("Too many schedule worksheets")
+    total_rows = 0
     for worksheet in workbook.worksheets:
+        rows, columns = worksheet.max_row or 0, worksheet.max_column or 0
+        validate_sheet_dimensions(rows, columns)
+        total_rows += rows
+        if total_rows > MAX_TOTAL_WORKSHEET_ROWS:
+            raise UnsafeDocumentError("The schedule workbook contains too many rows")
         if getattr(worksheet, "sheet_state", "visible") != "visible":
             continue
         if worksheet.title.strip().upper() == "ШАБЛОН":
@@ -138,6 +211,7 @@ def parse_workbook(workbook) -> list[ScheduleEntry]:
 
 
 def parse_worksheet(worksheet) -> list[ScheduleEntry]:
+    validate_sheet_dimensions(worksheet.max_row or 0, worksheet.max_column or 0)
     entries: list[ScheduleEntry] = []
     month_year = detect_month_year(worksheet)
     max_row = worksheet.max_row or 0

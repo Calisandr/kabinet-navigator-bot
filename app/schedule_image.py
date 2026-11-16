@@ -13,6 +13,8 @@ from .schedule import ScheduleEntry, group_entries_by_teacher, lesson_sort_key, 
 
 
 WIDTH = 1200
+MAX_SCHEDULE_IMAGE_HEIGHT = 8000
+MAX_RENDER_ENTRIES = 2000
 CARD_X = 46
 CARD_W = WIDTH - CARD_X * 2
 CONTENT_X = CARD_X + 48
@@ -42,9 +44,15 @@ CHIP_MINT = (222, 250, 243)
 
 def render_day_schedule_image(target: date, entries: Iterable[ScheduleEntry]) -> BytesIO:
     entries = list(entries)
+    if len(entries) > MAX_RENDER_ENTRIES or any(
+        len(entry.teacher) > 512 or len(entry.room) > 512 or len(entry.lesson) > 64 for entry in entries
+    ):
+        raise ValueError("The daily schedule is too large to render as a photo")
     fonts = FontSet.load()
     rows = build_rows(entries, fonts)
     height = calculate_height(rows, has_entries=bool(entries))
+    if height > MAX_SCHEDULE_IMAGE_HEIGHT:
+        raise ValueError("The daily schedule exceeds the photo canvas limit")
 
     image = Image.new("RGBA", (WIDTH, height), (255, 255, 255, 255))
     draw_background(image, height)
