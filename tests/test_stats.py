@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from app.stats import (
     ACTIVE_24H_WINDOW_SECONDS,
     ACTIVE_NOW_WINDOW_SECONDS,
     READ_ACTIVITY_SCRIPT,
+    REDIS_REQUEST_TIMEOUT,
     RECORD_ACTIVITY_SCRIPT,
     MemoryUserStatsStore,
     SQLiteUserStatsStore,
@@ -203,6 +205,8 @@ class FakeResponse:
     def __init__(self, payload, error=None):
         self.payload = payload
         self.error = error
+        self.status_code = 200
+        self.headers = {}
 
     def raise_for_status(self):
         if self.error:
@@ -210,6 +214,12 @@ class FakeResponse:
 
     def json(self):
         return self.payload
+
+    def iter_content(self, chunk_size):
+        yield json.dumps(self.payload).encode()
+
+    def close(self):
+        pass
 
 
 def test_redis_record_is_atomic_and_preserves_existing_lifetime_key(monkeypatch) -> None:
@@ -230,7 +240,9 @@ def test_redis_record_is_atomic_and_preserves_existing_lifetime_key(monkeypatch)
         "old_prefix:users", "old_prefix:last_seen", "old_prefix:activity_tracking_since",
         "123", f"{NOW.timestamp():.6f}",
     ]
-    assert kwargs["timeout"] == 5
+    assert kwargs["timeout"] == REDIS_REQUEST_TIMEOUT
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["stream"] is True
     assert kwargs["headers"] == {"Authorization": "Bearer fake-secret"}
     assert "'GT'" in RECORD_ACTIVITY_SCRIPT
     assert "EXPIRE" not in RECORD_ACTIVITY_SCRIPT.upper()
@@ -335,7 +347,7 @@ def test_redis_http_errors_are_not_reported_as_zero_users(monkeypatch) -> None:
     )
     store = UpstashRedisUserStatsStore("https://redis.example.invalid", "fake-secret", "prefix")
 
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(RuntimeError, match="Redis REST request failed"):
         asyncio.run(store.get_stats(NOW))
 
 

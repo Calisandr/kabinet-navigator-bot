@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-import requests
-
 from app.config import load_settings
 from app.commands import build_set_my_commands_payloads
+from app.telegram_admin import redact_admin_output, run_admin_action, telegram_api_call
 
 
 def main() -> None:
+    run_admin_action(_set_commands)
+
+
+def _set_commands() -> None:
     settings = load_settings()
     for payload in build_set_my_commands_payloads():
-        response = requests.post(
-            f"https://api.telegram.org/bot{settings.telegram_bot_token}/setMyCommands",
-            json=payload,
-            timeout=30,
+        result = telegram_api_call(
+            settings.telegram_bot_token, "setMyCommands", payload
         )
-        response.raise_for_status()
-        print(payload.get("scope"), payload.get("language_code"), response.json())
+        print(
+            payload.get("scope"), payload.get("language_code"),
+            redact_admin_output(result, settings.telegram_bot_token, settings.webhook_secret),
+        )
 
 
 if __name__ == "__main__":

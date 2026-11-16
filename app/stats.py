@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
 import os
+import socket
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -9,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -19,6 +23,47 @@ DEFAULT_STATS_DB_PATH = ".data/user_stats.sqlite3"
 DEFAULT_STATS_KEY_PREFIX = "kabinet_navigator"
 ACTIVE_NOW_WINDOW_SECONDS = 5 * 60
 ACTIVE_24H_WINDOW_SECONDS = 24 * 60 * 60
+MAX_TELEGRAM_USER_ID = (1 << 52) - 1
+MAX_REDIS_RESPONSE_BYTES = 64 * 1024
+REDIS_REQUEST_TIMEOUT = (0.75, 1.0)
+
+
+def validate_user_id(user_id: int) -> None:
+    if type(user_id) is not int or not 1 <= user_id <= MAX_TELEGRAM_USER_ID:
+        raise ValueError("Telegram user ID must be a positive integer within the supported range")
+
+
+def validate_redis_rest_url(value: str) -> str:
+    """Validate operator configuration without accepting arbitrary redirect targets."""
+    try:
+        if not isinstance(value, str) or any(ord(character) <= 32 for character in value):
+            raise ValueError
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        canonical_hostname = hostname.rstrip(".").lower() if hostname else ""
+        if (
+            parsed.scheme != "https" or not hostname or parsed.username is not None
+            or parsed.password is not None or parsed.port not in (None, 443)
+            or parsed.query or parsed.fragment or parsed.path not in ("", "/")
+            or "\\" in value or canonical_hostname == "localhost"
+            or canonical_hostname.endswith((".localhost", ".local"))
+            or "." not in canonical_hostname
+        ):
+            raise ValueError
+        try:
+            address = ipaddress.ip_address(canonical_hostname)
+        except ValueError:
+            # getaddrinfo also recognizes abbreviated/octal IPv4 forms such as
+            # 127.1 and 0177.0.0.1. Parse those without performing a DNS lookup.
+            try:
+                address = ipaddress.IPv4Address(socket.inet_aton(canonical_hostname))
+            except OSError:
+                address = None
+        if address is not None and not address.is_global:
+            raise ValueError
+        return urlunsplit(("https", parsed.netloc, "", "", ""))
+    except (TypeError, ValueError):
+        raise ValueError("Redis REST endpoint must be an HTTPS root URL without credentials or parameters") from None
 
 
 def utc_now() -> datetime:
@@ -72,6 +117,7 @@ class MemoryUserStatsStore:
             self._tracking_since = observed_at
 
     async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
+        validate_user_id(user_id)
         async with self._lock:
             observed_at = as_utc(observed_at if observed_at is not None else self._clock())
             previous = self._last_seen_by_user.get(user_id)
@@ -105,6 +151,7 @@ class SQLiteUserStatsStore:
         self._clock = clock
 
     async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
+        validate_user_id(user_id)
         if observed_at is not None:
             observed_at = as_utc(observed_at)
         await asyncio.to_thread(self._record_user_sync, user_id, observed_at)
@@ -270,7 +317,9 @@ class UpstashRedisUserStatsStore:
     def __init__(
         self, rest_url: str, rest_token: str, key_prefix: str, *, clock: Callable[[], datetime] | None = None
     ) -> None:
-        self.rest_url = rest_url.rstrip("/")
+        self.rest_url = validate_redis_rest_url(rest_url)
+        if not isinstance(rest_token, str) or not rest_token or any(character.isspace() for character in rest_token):
+            raise ValueError("Redis REST authentication token must be a non-empty value without whitespace")
         self.headers = {"Authorization": f"Bearer {rest_token}"}
         self.key_prefix = key_prefix.strip() or DEFAULT_STATS_KEY_PREFIX
         self._clock = clock
@@ -285,6 +334,7 @@ class UpstashRedisUserStatsStore:
         ]
 
     async def record_user(self, user_id: int, observed_at: datetime | None = None) -> None:
+        validate_user_id(user_id)
         if observed_at is None and self._clock is not None:
             observed_at = self._clock()
         timestamp = f"{as_utc(observed_at).timestamp():.6f}" if observed_at is not None else ""
@@ -331,14 +381,35 @@ class UpstashRedisUserStatsStore:
 
     def _run_script(self, script: str, args: list[str]) -> object:
         keys = self._keys()
-        response = requests.post(
-            self.rest_url,
-            headers=self.headers,
-            json=["EVAL", script, len(keys), *keys, *args],
-            timeout=5,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        response = None
+        try:
+            response = requests.post(
+                self.rest_url,
+                headers=self.headers,
+                json=["EVAL", script, len(keys), *keys, *args],
+                timeout=REDIS_REQUEST_TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("Redis REST redirects are not permitted")
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length", "")
+            if content_length.isdigit() and int(content_length) > MAX_REDIS_RESPONSE_BYTES:
+                raise RuntimeError("Redis REST response exceeds the allowed size")
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=4096):
+                content.extend(chunk)
+                if len(content) > MAX_REDIS_RESPONSE_BYTES:
+                    raise RuntimeError("Redis REST response exceeds the allowed size")
+            payload = json.loads(content)
+        except requests.RequestException:
+            raise RuntimeError("Redis REST request failed") from None
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise RuntimeError("Redis REST response was not valid JSON") from None
+        finally:
+            if response is not None:
+                response.close()
         if not isinstance(payload, dict):
             raise RuntimeError("Unexpected Upstash Redis response format")
         if payload.get("error"):

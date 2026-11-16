@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from PIL import Image
 MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_PDF_PAGES = 40
 MAX_PAGE_CHARACTERS = 100_000
+MAX_PAGE_OBJECTS = 20_000
+MAX_RENDER_PIXELS = 16_000_000
 TARGET_IMAGE_WIDTH = 1040
 MAX_IMAGE_HEIGHT = 8000
 MAX_PHOTO_DIMENSION_SUM = 10_000
@@ -118,10 +121,14 @@ def _table_geometry(page):
     width, height = page.get_size()
     verticals = []
     paths = []
-    for obj in page.get_objects():
+    for object_index, obj in enumerate(page.get_objects()):
+        if object_index >= MAX_PAGE_OBJECTS:
+            raise UnsupportedTimetableError("The timetable page contains too many drawing objects")
         if obj.type != pdfium.raw.FPDF_PAGEOBJ_PATH:
             continue
         left, bottom, right, top = obj.get_bounds()
+        if not all(math.isfinite(value) for value in (left, bottom, right, top)):
+            raise UnsupportedTimetableError("The timetable page contains invalid drawing coordinates")
         paths.append((left, bottom, right, top))
         if top - bottom >= height * 0.45 and right - left <= 4:
             verticals.append(((left + right) / 2, bottom, top))
@@ -327,10 +334,20 @@ def extract_groups(pdf_bytes: bytes) -> tuple[GroupLocation, ...]:
 def _render_rectangle(page, rectangle, scale: float) -> Image.Image:
     left, bottom, right, top = rectangle
     width, height = page.get_size()
+    if not all(math.isfinite(value) for value in (*rectangle, scale, width, height)) or scale <= 0:
+        raise UnsupportedTimetableError("The timetable crop has invalid coordinates")
     left, bottom = max(0.0, left), max(0.0, bottom)
     right, top = min(width, right), min(height, top)
     if right <= left or top <= bottom:
         raise UnsupportedTimetableError("The timetable crop is outside the PDF page")
+    pixel_width = math.ceil((right - left) * scale)
+    pixel_height = math.ceil((top - bottom) * scale)
+    if (
+        pixel_width <= 0 or pixel_height <= 0
+        or pixel_width > 10_000 or pixel_height > 10_000
+        or pixel_width * pixel_height > MAX_RENDER_PIXELS
+    ):
+        raise UnsupportedTimetableError("The timetable crop exceeds its rendering budget")
     bitmap = page.render(scale=scale, crop=(left, bottom, width - right, height - top))
     try:
         return bitmap.to_pil().convert("RGB").copy()

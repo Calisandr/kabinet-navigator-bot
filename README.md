@@ -44,7 +44,7 @@ Telegram-бот для расписания учебных групп Проко
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.txt
 copy .env.example .env
 ```
 
@@ -55,7 +55,7 @@ TELEGRAM_BOT_TOKEN=123456789:your_token_here
 GOOGLE_SHEET_ID=14inaoG-X5D6U3pLb1o0n3PwpZkSSlxGwoNlb6wVsU0Q
 BOT_TIMEZONE=Asia/Krasnoyarsk
 CACHE_MINUTES=15
-WEBHOOK_SECRET=change_me_to_a_random_secret
+WEBHOOK_SECRET=
 WEBHOOK_URL=https://your-vercel-domain.vercel.app
 ADMIN_USER_IDS=
 USER_STATS_DB_PATH=.data/user_stats.sqlite3
@@ -106,12 +106,20 @@ TELEGRAM_BOT_TOKEN=123456789:your_token_here
 GOOGLE_SHEET_ID=14inaoG-X5D6U3pLb1o0n3PwpZkSSlxGwoNlb6wVsU0Q
 BOT_TIMEZONE=Asia/Krasnoyarsk
 CACHE_MINUTES=15
-WEBHOOK_SECRET=любая_случайная_строка
+WEBHOOK_SECRET=
 ADMIN_USER_IDS=123456789
 UPSTASH_REDIS_REST_URL=
 UPSTASH_REDIS_REST_TOKEN=
 USER_STATS_KEY_PREFIX=kabinet_navigator
 ```
+
+Для `WEBHOOK_SECRET` сгенерируй значение и сохрани его в переменных окружения Vercel и локальном `.env`. Допускаются только латинские буквы, цифры, `_` и `-` (до 256 символов):
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Без секрета HTTP-обработчик отклоняет запросы с кодом 503, а скрипт установки webhook останавливается. Токен бота и секрет не публикуй в сообщениях или репозитории.
 
 3. Сделай Deploy.
 4. После деплоя установи webhook из локальной папки проекта:
@@ -185,9 +193,32 @@ Redis хранит общий набор пользователей и врем�
 Проверка проекта:
 
 ```bash
-pip install -r requirements.txt pytest
+pip install --require-hashes -r requirements.txt
+pip install -r requirements-dev.txt
 python -m pytest -q
 ```
+
+## Безопасность и автоматические проверки
+
+Подробности аудита, границы защиты и обслуживание — в [SECURITY.md](SECURITY.md).
+
+Webhook проверяет секрет до чтения тела; ограничивает размер запроса 256 КиБ и сложность JSON. Повторно доставленный успешный запрос не обрабатывается снова в том же процессе (до 4096 ID за 24 часа). Для одного пользователя доступно 20 запросов сразу с восстановлением одного запроса в секунду; уведомления о лимите отправляются не чаще раза в 5 секунд. Анонимные администраторы групп могут пользоваться командами, их лимит учитывается по группе. Эти ограничения действуют на экземпляр приложения; защиту от распределённой нагрузки обеспечивает хостинг.
+
+Повторные `/refresh` в течение 20 секунд используют уже загруженные данные. Запрос преподавателя ограничен 120 символами. Обычные команды, кнопки и недельное расписание группы одним изображением сохранены.
+
+Загрузки ограничены официальными HTTPS-источниками; переходы проверяются до выполнения. Перед чтением XLSX проверяются архив, XML, размеры листов и объединённых диапазонов. `defusedxml` блокирует DTD и сущности. PDF и изображения имеют лимиты размера, объектов и пикселей; нативный PDFium работает под общим lock, без отдельной песочницы процесса.
+
+Runtime-зависимости закреплены версиями и SHA-256 в `requirements.txt`. При намеренном обновлении измени `requirements.in`, затем пересобери lock и запусти проверки:
+
+```bash
+uv pip compile requirements.in --python-version 3.12 --universal --generate-hashes --output-file requirements.txt
+python -m pytest -q
+python -m compileall -q app api scripts tests
+python -m bandit -q -r app api scripts
+python -m pip_audit --strict --require-hashes --disable-pip --progress-spinner off -r requirements.txt
+```
+
+GitHub Actions выполняет эти проверки для pull request и `main` без доступа к production-секретам. E2E-тесты используют локальный HTTP-сервер, настоящие обработчики python-telegram-bot и подмену Telegram/источников: тестовые сообщения реальным пользователям не отправляются.
 
 ## Команды бота
 

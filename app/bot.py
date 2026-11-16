@@ -18,6 +18,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -27,6 +28,7 @@ from telegram.ext import (
 )
 
 from .commands import COMMANDS, COMMAND_LANGUAGE_CODES, COMMAND_SCOPE_TYPES
+from .abuse import RequestBudget
 from .config import Settings, load_settings
 from .formatting import (
     format_date,
@@ -49,17 +51,20 @@ from .group_schedule import GroupScheduleService
 from .schedule import GoogleSheetScheduleRepository, Schedule
 from .schedule_image import render_day_schedule_image
 from .stats import UserStatsStore, build_user_stats_store
+from .security_logging import install_secret_redaction
 
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+install_secret_redaction()
 # HTTPX request URLs include the Telegram bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
 STATS_RECORD_TIMEOUT_SECONDS = 2.0
 STATS_READ_TIMEOUT_SECONDS = 3.0
+MAX_TEACHER_QUERY_CHARACTERS = 120
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -87,6 +92,8 @@ class ScheduleCache:
             now = asyncio.get_running_loop().time()
             is_fresh = self._schedule is not None and now - self._loaded_monotonic < self.ttl_seconds
             if is_fresh and not force:
+                return self._schedule
+            if force and self._schedule is not None and now - self._loaded_monotonic < 20:
                 return self._schedule
 
             schedule = await asyncio.to_thread(self.repository.load)
@@ -133,6 +140,41 @@ async def track_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception as exc:
         LOGGER.warning("User activity could not be recorded (%s)", type(exc).__name__)
+
+
+async def guard_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+    message = update.effective_message if hasattr(update, "effective_message") else None
+    sender_chat = getattr(message, "sender_chat", None)
+    if user.is_bot and sender_chat is None:
+        raise ApplicationHandlerStop
+    budget = context.application.bot_data["request_budget"]
+    # Anonymous administrators share Telegram's synthetic bot identity. Use
+    # their sending chat so unrelated groups do not share the same budget.
+    budget_key = sender_chat.id if user.is_bot else user.id
+    if not budget.allow(budget_key):
+        # Stop before statistics, document fetching or rendering. Repeated
+        # limit responses would themselves amplify a flooding account.
+        if budget.should_notify(budget_key):
+            notice = "Слишком много запросов. Подождите несколько секунд."
+            if update.callback_query is not None:
+                await update.callback_query.answer(notice)
+            elif update.effective_message is not None:
+                await update.effective_message.reply_text(notice)
+        raise ApplicationHandlerStop
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    LOGGER.error("Telegram update handler failed (%s)", type(context.error).__name__)
+    if isinstance(update, Update) and update.effective_message is not None:
+        try:
+            await update.effective_message.reply_text(
+                "Не удалось обработать запрос. Попробуйте чуть позже.", reply_markup=MAIN_KEYBOARD,
+            )
+        except Exception as exc:
+            LOGGER.warning("Could not send an error response (%s)", type(exc).__name__)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,6 +443,12 @@ async def send_teacher_schedule(
     context: ContextTypes.DEFAULT_TYPE,
     query: str,
 ) -> None:
+    if len(query) > MAX_TEACHER_QUERY_CHARACTERS:
+        await update.effective_message.reply_text(
+            "Слишком длинный запрос. Введите фамилию или часть ФИО (до 120 символов).",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
     schedule = await get_cache(context).get()
     text = format_teacher_schedule(query, schedule.search_teacher(query), today_for(context))
     await reply_split(update, text)
@@ -486,7 +534,9 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["schedule_cache"] = cache
     application.bot_data["user_stats_store"] = build_user_stats_store(settings)
     application.bot_data["group_schedule_service"] = GroupScheduleService()
+    application.bot_data["request_budget"] = RequestBudget()
 
+    application.add_handler(TypeHandler(Update, guard_requests), group=-2)
     application.add_handler(TypeHandler(Update, track_usage), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -503,6 +553,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_error_handler(on_error)
     return application
 
 

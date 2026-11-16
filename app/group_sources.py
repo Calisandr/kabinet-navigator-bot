@@ -270,12 +270,16 @@ class GroupScheduleRepository:
             return content
 
     def _download(self, url: str, *, pdf: bool, limit: int) -> bytes:
+        deadline = time.monotonic() + 30.0
         try:
             for _ in range(5):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GroupSourceError("The official timetable exceeded its download deadline")
                 # Follow redirects manually: reject an untrusted Location before
                 # issuing a request to it, rather than validating only afterward.
                 with self._session.get(
-                    url, timeout=(5, 15), stream=True, allow_redirects=False
+                    url, timeout=(min(5.0, remaining), min(15.0, remaining)), stream=True, allow_redirects=False
                 ) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
@@ -294,6 +298,8 @@ class GroupScheduleRepository:
                     chunks: list[bytes] = []
                     size = 0
                     for chunk in response.iter_content(chunk_size=65536):
+                        if time.monotonic() > deadline:
+                            raise GroupSourceError("The official timetable exceeded its download deadline")
                         if not chunk:
                             continue
                         size += len(chunk)
