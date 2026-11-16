@@ -180,12 +180,11 @@ def test_long_unknown_group_input_returns_a_telegram_sized_error(monkeypatch):
 
     asyncio.run(group_bot.group_command(update, ctx))
 
-    assert message.reply_text.await_count == 2
+    assert message.reply_text.await_count == 1
     text = message.reply_text.await_args.args[0]
     visible = CaptionText()
     visible.feed(text)
     assert len(visible.text.encode("utf-16-le")) // 2 <= 4096
-    assert "Введите полный код группы" in text
-    assert group_bot.GROUP_SCHEDULE_PAGE_URL in text
-    assert "&lt;&amp;" in text
+    assert "Слишком длинный запрос" in text
+    assert "<&" not in text
     message.reply_photo.assert_not_awaited()

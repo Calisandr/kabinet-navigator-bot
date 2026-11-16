@@ -381,42 +381,51 @@ class UpstashRedisUserStatsStore:
 
     def _run_script(self, script: str, args: list[str]) -> object:
         keys = self._keys()
-        response = None
-        try:
-            response = requests.post(
-                self.rest_url,
-                headers=self.headers,
-                json=["EVAL", script, len(keys), *keys, *args],
-                timeout=REDIS_REQUEST_TIMEOUT,
-                allow_redirects=False,
-                stream=True,
-            )
-            if 300 <= response.status_code < 400:
-                raise RuntimeError("Redis REST redirects are not permitted")
-            response.raise_for_status()
-            content_length = response.headers.get("Content-Length", "")
-            if content_length.isdigit() and int(content_length) > MAX_REDIS_RESPONSE_BYTES:
+        return redis_rest_command(self.rest_url, self.headers, ["EVAL", script, len(keys), *keys, *args])
+
+
+def redis_rest_command(rest_url: str, headers: dict[str, str], command: list[object]) -> object:
+    """Use the same bounded, non-redirecting transport for app-owned Redis commands.
+
+    Endpoint and authentication are validated when the owning store is built.
+    Command names are fixed by callers, and data stays in separate JSON items.
+    """
+    response = None
+    try:
+        response = requests.post(
+            rest_url,
+            headers=headers,
+            json=command,
+            timeout=REDIS_REQUEST_TIMEOUT,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            raise RuntimeError("Redis REST redirects are not permitted")
+        response.raise_for_status()
+        content_length = response.headers.get("Content-Length", "")
+        if content_length.isdigit() and int(content_length) > MAX_REDIS_RESPONSE_BYTES:
+            raise RuntimeError("Redis REST response exceeds the allowed size")
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=4096):
+            content.extend(chunk)
+            if len(content) > MAX_REDIS_RESPONSE_BYTES:
                 raise RuntimeError("Redis REST response exceeds the allowed size")
-            content = bytearray()
-            for chunk in response.iter_content(chunk_size=4096):
-                content.extend(chunk)
-                if len(content) > MAX_REDIS_RESPONSE_BYTES:
-                    raise RuntimeError("Redis REST response exceeds the allowed size")
-            payload = json.loads(content)
-        except requests.RequestException:
-            raise RuntimeError("Redis REST request failed") from None
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-            raise RuntimeError("Redis REST response was not valid JSON") from None
-        finally:
-            if response is not None:
-                response.close()
-        if not isinstance(payload, dict):
-            raise RuntimeError("Unexpected Upstash Redis response format")
-        if payload.get("error"):
-            raise RuntimeError("Upstash Redis rejected the activity request")
-        if "result" not in payload:
-            raise RuntimeError("Missing Upstash Redis activity result")
-        return payload["result"]
+        payload = json.loads(content)
+    except requests.RequestException:
+        raise RuntimeError("Redis REST request failed") from None
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise RuntimeError("Redis REST response was not valid JSON") from None
+    finally:
+        if response is not None:
+            response.close()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected Upstash Redis response format")
+    if payload.get("error"):
+        raise RuntimeError("Upstash Redis rejected the request")
+    if "result" not in payload:
+        raise RuntimeError("Missing Upstash Redis result")
+    return payload["result"]
 
 
 def build_user_stats_store(settings: Settings) -> UserStatsStore:

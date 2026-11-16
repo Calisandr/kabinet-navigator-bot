@@ -18,6 +18,7 @@ from .group_sources import (
     GroupScheduleSource,
     GroupSourceError,
     pick_sources,
+    pick_sources_in_range,
 )
 
 
@@ -126,9 +127,7 @@ class GroupScheduleService:
         self._indexes: OrderedDict[tuple[str, str], tuple[GroupLocation, ...]] = OrderedDict()
         self._index_lock = threading.RLock()
 
-    def _sources(
-        self, today: date, category: str | None, period_start: date | None
-    ) -> tuple[GroupScheduleSource, ...]:
+    def _catalog(self, category: str | None) -> tuple[GroupScheduleSource, ...]:
         if category is not None and category not in {"vo", "spo", "part_time"}:
             raise GroupScheduleError("Не удалось определить раздел расписания. Выберите его заново.")
         try:
@@ -139,10 +138,39 @@ class GroupScheduleService:
             ) from exc
         if category is not None:
             catalog = tuple(source for source in catalog if source.category == category)
+        return tuple(catalog)
+
+    def list_periods(self, today: date, category: str | None = None) -> tuple[GroupScheduleSource, ...]:
+        """List actual published periods, newest first, without downloading PDFs."""
+        catalog = self._catalog(category)
+        by_period = {(source.category, source.start, source.end): source for source in catalog}
+        return tuple(sorted(
+            by_period.values(), key=lambda source: (source.start, source.end, source.category), reverse=True,
+        ))
+
+    def _sources(
+        self, today: date, category: str | None, period_start: date | None,
+        period_end: date | None = None,
+    ) -> tuple[GroupScheduleSource, ...]:
+        if period_end is not None:
+            if (
+                type(period_start) is not date or type(period_end) is not date
+                or not 0 <= (period_end - period_start).days < 31
+            ):
+                raise GroupScheduleError("Выберите корректный период от 1 до 31 дня.")
+        catalog = self._catalog(category)
         target = period_start or today
-        sources = pick_sources(catalog, target=target, prefer="current" if period_start else "available")
+        sources = (
+            pick_sources_in_range(catalog, period_start, period_end)
+            if period_end is not None
+            else pick_sources(catalog, target=target, prefer="current" if period_start else "available")
+        )
         if not sources:
-            period = f" на {target:%d.%m.%Y}" if period_start else ""
+            period = (
+                f" за {period_start:%d.%m.%Y} — {period_end:%d.%m.%Y}"
+                if period_end is not None
+                else (f" на {target:%d.%m.%Y}" if period_start else "")
+            )
             raise GroupScheduleError(
                 f"Расписание{period} пока не найдено среди опубликованных документов. "
                 "Проверьте официальный раздел филиала."
@@ -164,11 +192,12 @@ class GroupScheduleService:
         return locations
 
     def _groups(
-        self, today: date, category: str | None, period_start: date | None
+        self, today: date, category: str | None, period_start: date | None,
+        period_end: date | None = None,
     ) -> tuple[tuple[_IndexedGroup, ...], tuple[GroupScheduleSource, ...]]:
         groups: list[_IndexedGroup] = []
         errors: list[GroupScheduleSource] = []
-        for source in self._sources(today, category, period_start):
+        for source in self._sources(today, category, period_start, period_end):
             try:
                 content = self.repository.get_pdf(source)
                 locations = self._locations(source, content)
@@ -190,9 +219,10 @@ class GroupScheduleService:
         return tuple(groups), tuple(errors)
 
     def list_groups(
-        self, today: date, category: str | None = None, period_start: date | None = None
+        self, today: date, category: str | None = None, period_start: date | None = None,
+        *, period_end: date | None = None,
     ) -> tuple[GroupOption, ...]:
-        groups, errors = self._groups(today, category, period_start)
+        groups, errors = self._groups(today, category, period_start, period_end)
         if errors:
             raise GroupScheduleError(
                 "Часть опубликованных расписаний временно недоступна. "
@@ -211,11 +241,13 @@ class GroupScheduleService:
         today: date,
         category: str | None = None,
         period_start: date | None = None,
+        *,
+        period_end: date | None = None,
     ) -> GroupTimetable:
         needle = normalize_group(query)
         if not needle or len(query) > 80:
             raise GroupNotFound("Введите полный код группы, например ИСт-241.2.")
-        groups, errors = self._groups(today, category, period_start)
+        groups, errors = self._groups(today, category, period_start, period_end)
         matches = [item for item in groups if normalize_group(item.location.group) == needle]
         # A combined header can expose the same alias twice. Use geometry, not
         # partial text matching, to identify the intended published column.

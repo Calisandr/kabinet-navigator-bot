@@ -44,14 +44,17 @@ from .group_bot import (
     groups_command,
     handle_group_callback,
     looks_like_group,
+    my_group_command,
     on_group_text,
     send_group_prompt,
+    week_command,
 )
 from .group_schedule import GroupScheduleService
 from .schedule import GoogleSheetScheduleRepository, Schedule
 from .schedule_image import render_day_schedule_image
 from .stats import UserStatsStore, build_user_stats_store
 from .security_logging import install_secret_redaction
+from .preferences import build_user_preferences_store
 
 
 logging.basicConfig(
@@ -68,11 +71,11 @@ MAX_TEACHER_QUERY_CHARACTERS = 120
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["Расписание группы"],
+        ["⭐ Моя группа", "Расписание группы"],
         ["Вчера", "Сегодня", "Завтра"],
-        ["Ближайшие даты", "Найти преподавателя"],
-        ["Все преподаватели", "Обновить"],
-        ["Статистика"],
+        ["Найти преподавателя", "Все преподаватели"],
+        ["Ближайшие даты"],
+        ["Обновить", "Статистика"],
     ],
     resize_keyboard=True,
     input_field_placeholder="Группа, фамилия или дата",
@@ -184,6 +187,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "из официальных документов сайта. Нажми <b>«Расписание группы»</b> "
         "или отправь код: <code>ИСт-241.2</code>.\n"
         "Пришлю читаемый фрагмент с предметами и ссылкой на оригинальный PDF.\n\n"
+        "Нажмите под ним <b>«⭐ Закрепить группу»</b> — затем её расписание всегда под рукой в <b>«⭐ Моя группа»</b>. "
+        "Недели и опубликованные периоды выбираются кнопками под изображением.\n\n"
         "Также можно найти преподавателя по фамилии: <code>Григорьев</code>. "
         "Кнопки «Сегодня», «Завтра» и даты показывают занятость компьютерных кабинетов "
         "по данным Google Таблицы.\n"
@@ -202,7 +207,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Команды</b>\n\n"
         "<b>Расписание учебных групп</b>\n"
         "/group ИСт-241.2 - предметы и пары выбранной группы\n"
-        "/groups - список групп по разделам\n\n"
+        "/groups - список групп по разделам\n"
+        "/mygroup - открыть закреплённую группу\n"
+        "/week next - следующая неделя моей группы\n"
+        "/week previous - прошлая неделя\n"
+        "/week 16.11.2026 22.11.2026 - свой период\n"
+        "/group ИСт-241.2 next - неделя без закрепления\n\n"
         "<b>Компьютерные кабинеты</b>\n"
         "/today - расписание на сегодня\n"
         "/tomorrow - расписание на завтра\n"
@@ -363,7 +373,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if lowered == "статистика":
         await stats_command(update, context)
         return
-    if lowered in {"расписание группы", "расписание групп", "моя группа"}:
+    if lowered in {"моя группа", "⭐ моя группа"}:
+        context.user_data.pop("awaiting_teacher", None)
+        await my_group_command(update, context)
+        return
+    if lowered in {"расписание группы", "расписание групп"}:
         context.user_data.pop("awaiting_teacher", None)
         await send_group_prompt(update, context)
         return
@@ -457,10 +471,11 @@ async def send_teacher_schedule(
 async def send_next_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     schedule = await get_cache(context).get()
     dates = schedule.next_dates(today_for(context))
-    buttons = [
-        [InlineKeyboardButton(format_short_date(item), callback_data=f"date:{item.isoformat()}")]
+    date_buttons = [
+        InlineKeyboardButton(format_short_date(item), callback_data=f"date:{item.isoformat()}")
         for item in dates[:10]
     ]
+    buttons = [date_buttons[index:index + 2] for index in range(0, len(date_buttons), 2)]
     await update.effective_message.reply_text(
         format_next_dates(dates),
         parse_mode=ParseMode.HTML,
@@ -533,6 +548,7 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
     application.bot_data["schedule_cache"] = cache
     application.bot_data["user_stats_store"] = build_user_stats_store(settings)
+    application.bot_data["user_preferences_store"] = build_user_preferences_store(settings)
     application.bot_data["group_schedule_service"] = GroupScheduleService()
     application.bot_data["request_budget"] = RequestBudget()
 
@@ -542,6 +558,8 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("group", group_command))
     application.add_handler(CommandHandler("groups", groups_command))
+    application.add_handler(CommandHandler("mygroup", my_group_command))
+    application.add_handler(CommandHandler("week", week_command))
     application.add_handler(CommandHandler("yesterday", yesterday_command))
     application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("tomorrow", tomorrow_command))
